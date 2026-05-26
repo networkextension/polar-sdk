@@ -61,14 +61,31 @@ type authCacheEntry struct {
 	storeAt time.Time
 }
 
+// UIRoute is one sidebar nav entry a plugin offers. Heartbeated up
+// to dock and aggregated into the dynamic sidebar source for
+// polar-dock-ui. See task #196 / project-llm-billing-state.
+//
+// Plugins that have no UI surface (polar-packtunnel, polar-agent)
+// either omit UIRoutes from HeartbeatOpts or pass an empty slice;
+// dock preserves the existing value when UIRoutes is nil/empty so
+// a heartbeat that doesn't carry routes never blanks the column.
+type UIRoute struct {
+	Path      string `json:"path"`                  // "/expense.html"
+	Label     string `json:"label"`                 // "家庭账本"
+	Icon      string `json:"icon,omitempty"`        // lucide icon name (optional)
+	AdminOnly bool   `json:"admin_only,omitempty"`  // UI hint: hide for non-admin role
+	Order     int    `json:"order,omitempty"`       // UI sort hint; ties broken by label
+}
+
 // HeartbeatOpts is the POST /internal/v1/plugin-registry/heartbeat body.
 // Name is filled in automatically from c.PluginName so callers can pass
 // {} when they only want to refresh the timestamp.
 type HeartbeatOpts struct {
-	Version       string `json:"version,omitempty"`
-	Endpoint      string `json:"endpoint,omitempty"`
-	UptimeSeconds int64  `json:"uptime_seconds,omitempty"`
-	MetricsURL    string `json:"metrics_url,omitempty"`
+	Version       string    `json:"version,omitempty"`
+	Endpoint      string    `json:"endpoint,omitempty"`
+	UptimeSeconds int64     `json:"uptime_seconds,omitempty"`
+	MetricsURL    string    `json:"metrics_url,omitempty"`
+	UIRoutes      []UIRoute `json:"ui_routes,omitempty"`
 }
 
 // NewClient builds a Client with a sane default HTTP timeout (15s).
