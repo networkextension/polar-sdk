@@ -151,6 +151,66 @@ func TestAgentLLMCallRecord_Posts(t *testing.T) {
 	}
 }
 
+func TestVideoShotCallRecord_Posts(t *testing.T) {
+	var capturedURL string
+	var capturedBody string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		capturedURL = r.URL.Path
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		capturedBody = string(buf[:n])
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"recorded":true,"deduped":false,"id":42}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	err := c.VideoShotCallRecord(VideoShotCallRecord{
+		WorkspaceID: "t_root", ProjectID: 7, ShotID: 99,
+		Provider: "video.seedance", Model: "doubao-seedance-1-0-pro-250528",
+		Resolution: "1080p", DurationChargedSec: 10, FPS: 24, FramesTotal: 240,
+		CostUSD: 0.50, CostPerFrameUSD: 0.002083,
+		BillingMeta: map[string]any{"rate_usd_per_sec": 0.05},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if capturedURL != "/internal/v1/billing/video-shots" {
+		t.Fatalf("URL: got %q", capturedURL)
+	}
+	if !strings.Contains(capturedBody, `"shot_id":99`) {
+		t.Fatalf("body missing shot_id: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, `"cost_usd":0.5`) {
+		t.Fatalf("body missing cost_usd: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, `"provider":"video.seedance"`) {
+		t.Fatalf("body missing provider: %s", capturedBody)
+	}
+}
+
+func TestVideoShotCallRecord_AlwaysIncludesCostUSDEvenWhenZero(t *testing.T) {
+	// Pricing miss returns cost=0; the on-wire JSON must still carry
+	// the field so dock's audit can distinguish "row recorded, no
+	// price" from "field omitted".
+	var body string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		body = string(buf[:n])
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"recorded":true}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	_ = c.VideoShotCallRecord(VideoShotCallRecord{
+		WorkspaceID: "t_root", ProjectID: 1, ShotID: 2,
+		Provider: "video.runway", CostUSD: 0,
+	})
+	if !strings.Contains(body, `"cost_usd":0`) {
+		t.Fatalf("cost_usd=0 must be present in body, got: %s", body)
+	}
+}
+
 func TestEmptyArgsRejected(t *testing.T) {
 	c := newTestClient("http://unused")
 	if _, err := c.UserGet(""); err == nil {

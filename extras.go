@@ -136,6 +136,34 @@ type AgentLLMCallRecord struct {
 	CostOverrideUSD *float64 `json:"cost_override_usd,omitempty"`
 }
 
+// VideoShotCallRecord mirrors POST /internal/v1/billing/video-shots.
+// Video plugins (polar-video and any future Kling/Runway/Pika sibling)
+// call this once per successfully-generated shot so the per-shot cost
+// shows up in the same per-workspace ledger as text-LLM usage.
+//
+// Idempotent: dock dedupes on ShotID, so a re-post (e.g. retry after
+// transient network blip) returns 200 with {recorded: true,
+// deduped: true} rather than 409.
+//
+// CostUSD = 0 is a legitimate value (price table missed but the row
+// is still recorded for forensic review) — don't omit on zero. The
+// BillingMeta map should carry the raw pricing-table snapshot used
+// so a future audit can reproduce the math.
+type VideoShotCallRecord struct {
+	WorkspaceID        string         `json:"workspace_id"`
+	ProjectID          int64          `json:"project_id"`
+	ShotID             int64          `json:"shot_id"`
+	Provider           string         `json:"provider"`
+	Model              string         `json:"model,omitempty"`
+	Resolution         string         `json:"resolution,omitempty"`
+	DurationChargedSec float64        `json:"duration_charged_sec,omitempty"`
+	FPS                int            `json:"fps,omitempty"`
+	FramesTotal        int            `json:"frames_total,omitempty"`
+	CostUSD            float64        `json:"cost_usd"`
+	CostPerFrameUSD    float64        `json:"cost_per_frame_usd,omitempty"`
+	BillingMeta        map[string]any `json:"billing_meta,omitempty"`
+}
+
 // ── Caching scaffolding ─────────────────────────────────────────────
 
 type cacheEntry[T any] struct {
@@ -345,6 +373,18 @@ func (c *Client) AgentDispatch(req AgentDispatchRequest) (*AgentDispatchResponse
 // ledger admins see in /llm-billing.html.
 func (c *Client) AgentLLMCallRecord(req AgentLLMCallRecord) error {
 	resp, err := c.Do(http.MethodPost, "/internal/v1/agent/llm-call-record", req)
+	if err != nil {
+		return err
+	}
+	return readJSON(resp, nil)
+}
+
+// VideoShotCallRecord wraps POST /internal/v1/billing/video-shots.
+// Best-effort: callers should log + continue on failure — the
+// downstream poll loop will retry next tick, and dock dedupes by
+// ShotID so retries are safe.
+func (c *Client) VideoShotCallRecord(req VideoShotCallRecord) error {
+	resp, err := c.Do(http.MethodPost, "/internal/v1/billing/video-shots", req)
 	if err != nil {
 		return err
 	}
