@@ -133,6 +133,53 @@ func TestBotUserGet_NotCached(t *testing.T) {
 	}
 }
 
+func TestWorkspacePluginAccess_AllowsRoot(t *testing.T) {
+	var capturedPath string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.RequestURI()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"workspace_id":"t_root","plugin":"expense","enabled":true}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	got, err := c.WorkspacePluginAccess("t_root", "expense")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !got.Enabled {
+		t.Fatalf("expected enabled=true, got %+v", got)
+	}
+	if !strings.Contains(capturedPath, "workspace_id=t_root") || !strings.Contains(capturedPath, "plugin=expense") {
+		t.Fatalf("URL didn't carry both query params: %s", capturedPath)
+	}
+}
+
+func TestWorkspacePluginAccess_DeniesNonRootWithoutGrant(t *testing.T) {
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"workspace_id":"t_alpha","plugin":"expense","enabled":false}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	got, err := c.WorkspacePluginAccess("t_alpha", "expense")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled {
+		t.Fatalf("expected enabled=false, got %+v", got)
+	}
+}
+
+func TestWorkspacePluginAccess_RejectsEmptyArgs(t *testing.T) {
+	c := newTestClient("http://unused")
+	if _, err := c.WorkspacePluginAccess("", "expense"); err == nil {
+		t.Fatal("empty workspaceID should reject")
+	}
+	if _, err := c.WorkspacePluginAccess("t_x", ""); err == nil {
+		t.Fatal("empty plugin should reject")
+	}
+}
+
 func TestAgentLLMCallRecord_Posts(t *testing.T) {
 	called := false
 	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
