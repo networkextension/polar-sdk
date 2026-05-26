@@ -10,6 +10,7 @@ Provides:
 - Cached lookups: `AuthVerify(token)`, `UserGet(id)`, `TeamGet(id)` (30s TTL)
 - Uncached lookups for sensitive data: `LLMConfigGet`, `BotUserGet`, `ChatThreadGet`, `AgentPresenceGet`
 - Dispatch helpers: `AgentDispatch`, `AgentLLMCallRecord`, `VideoShotCallRecord`
+- Tenant access: `WorkspacePluginAccess(workspaceID, plugin)` — closed-by-default; root team always allowed
 - `Heartbeat` — plugin → dock liveness signal
 
 ## Install

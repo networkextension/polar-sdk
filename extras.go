@@ -17,6 +17,7 @@ package sdk
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -377,6 +378,47 @@ func (c *Client) AgentLLMCallRecord(req AgentLLMCallRecord) error {
 		return err
 	}
 	return readJSON(resp, nil)
+}
+
+// WorkspacePluginAccessResp mirrors the dock response for
+// GET /internal/v1/workspace-plugin-access?workspace_id=&plugin=
+type WorkspacePluginAccessResp struct {
+	WorkspaceID string `json:"workspace_id"`
+	Plugin      string `json:"plugin"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// WorkspacePluginAccess asks dock whether the given workspace may
+// use this plugin. Closed-by-default semantics — missing config
+// rows return Enabled=false. Root workspace always returns true.
+//
+// Recommended caller pattern: cache the answer for ~60s, since
+// access grants change rarely (admin grants once, leaves it).
+//
+// Plugins call this in their auth middleware AFTER the dock has
+// verified the bearer token + resolved workspace_id, but BEFORE
+// dispatching to business handlers.
+func (c *Client) WorkspacePluginAccess(workspaceID, plugin string) (*WorkspacePluginAccessResp, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	plugin = strings.TrimSpace(plugin)
+	if workspaceID == "" {
+		return nil, errInvalid("workspaceID required")
+	}
+	if plugin == "" {
+		return nil, errInvalid("plugin required")
+	}
+	resp, err := c.Do(http.MethodGet,
+		"/internal/v1/workspace-plugin-access?workspace_id="+url.QueryEscape(workspaceID)+"&plugin="+url.QueryEscape(plugin),
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var out WorkspacePluginAccessResp
+	if err := readJSON(resp, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // VideoShotCallRecord wraps POST /internal/v1/billing/video-shots.
