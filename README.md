@@ -9,7 +9,7 @@ Provides:
 - `sdk.DeriveHMACKey(plaintextToken)` — derives the signing key from the plugin token issued by dock
 - Cached lookups: `AuthVerify(token)`, `UserGet(id)`, `TeamGet(id)` (30s TTL)
 - Uncached lookups for sensitive data: `LLMConfigGet`, `BotUserGet`, `ChatThreadGet`, `AgentPresenceGet`
-- Dispatch helpers: `AgentDispatch`, `AgentLLMCallRecord`
+- Dispatch helpers: `AgentDispatch`, `AgentLLMCallRecord`, `VideoShotCallRecord`
 - `Heartbeat` — plugin → dock liveness signal
 
 ## Install
