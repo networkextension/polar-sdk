@@ -258,6 +258,128 @@ func TestVideoShotCallRecord_AlwaysIncludesCostUSDEvenWhenZero(t *testing.T) {
 	}
 }
 
+func TestIssueAgentToken_Posts(t *testing.T) {
+	var capturedURL, capturedBody string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		capturedURL = r.URL.Path
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		capturedBody = string(buf[:n])
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"tok_abc","deduped":false}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	out, err := c.IssueAgentToken(AgentTokenIssueRequest{
+		ID:              "tok_abc",
+		UserID:          "u_owner",
+		Name:            "enroll:emei",
+		TokenHash:       "deadbeef",
+		CoderConfigJSON: `{"pending_enrollment":true}`,
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if out.ID != "tok_abc" || out.Deduped {
+		t.Fatalf("response: %+v", out)
+	}
+	if capturedURL != "/internal/v1/agent-tokens/issue" {
+		t.Fatalf("URL: got %q", capturedURL)
+	}
+	if !strings.Contains(capturedBody, `"id":"tok_abc"`) {
+		t.Fatalf("body missing id: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, `"token_hash":"deadbeef"`) {
+		t.Fatalf("body missing token_hash: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, `pending_enrollment`) {
+		t.Fatalf("body missing coder_config_json: %s", capturedBody)
+	}
+}
+
+func TestIssueAgentToken_DedupedResponse(t *testing.T) {
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"tok_abc","deduped":true}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	out, err := c.IssueAgentToken(AgentTokenIssueRequest{
+		ID: "tok_abc", UserID: "u_owner", TokenHash: "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !out.Deduped {
+		t.Fatalf("expected deduped=true, got %+v", out)
+	}
+}
+
+func TestIssueAgentToken_RejectsEmptyArgs(t *testing.T) {
+	c := newTestClient("http://unused")
+	if _, err := c.IssueAgentToken(AgentTokenIssueRequest{UserID: "u", TokenHash: "h"}); err == nil {
+		t.Fatal("empty id should reject")
+	}
+	if _, err := c.IssueAgentToken(AgentTokenIssueRequest{ID: "tok", TokenHash: "h"}); err == nil {
+		t.Fatal("empty user_id should reject")
+	}
+	if _, err := c.IssueAgentToken(AgentTokenIssueRequest{ID: "tok", UserID: "u"}); err == nil {
+		t.Fatal("empty token_hash should reject")
+	}
+}
+
+func TestIssueHost_Posts(t *testing.T) {
+	var capturedURL, capturedBody string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		capturedURL = r.URL.Path
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		capturedBody = string(buf[:n])
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"h_xyz","deduped":false}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	out, err := c.IssueHost(HostIssueRequest{
+		ID: "h_xyz", WorkspaceID: "t_root", Slug: "emei", Name: "emei",
+		AgentTokenID: "tok_abc", OS: "darwin", Arch: "arm64",
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if out.ID != "h_xyz" {
+		t.Fatalf("response: %+v", out)
+	}
+	if capturedURL != "/internal/v1/hosts/issue" {
+		t.Fatalf("URL: got %q", capturedURL)
+	}
+	if !strings.Contains(capturedBody, `"id":"h_xyz"`) {
+		t.Fatalf("body missing id: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, `"workspace_id":"t_root"`) {
+		t.Fatalf("body missing workspace_id: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, `"agent_token_id":"tok_abc"`) {
+		t.Fatalf("body missing agent_token_id: %s", capturedBody)
+	}
+}
+
+func TestIssueHost_RejectsEmptyArgs(t *testing.T) {
+	c := newTestClient("http://unused")
+	if _, err := c.IssueHost(HostIssueRequest{WorkspaceID: "t", Slug: "s", Name: "n"}); err == nil {
+		t.Fatal("empty id should reject")
+	}
+	if _, err := c.IssueHost(HostIssueRequest{ID: "h", Slug: "s", Name: "n"}); err == nil {
+		t.Fatal("empty workspace_id should reject")
+	}
+	if _, err := c.IssueHost(HostIssueRequest{ID: "h", WorkspaceID: "t", Name: "n"}); err == nil {
+		t.Fatal("empty slug should reject")
+	}
+	if _, err := c.IssueHost(HostIssueRequest{ID: "h", WorkspaceID: "t", Slug: "s"}); err == nil {
+		t.Fatal("empty name should reject")
+	}
+}
+
 func TestEmptyArgsRejected(t *testing.T) {
 	c := newTestClient("http://unused")
 	if _, err := c.UserGet(""); err == nil {

@@ -10,6 +10,7 @@ Provides:
 - Cached lookups: `AuthVerify(token)`, `UserGet(id)`, `TeamGet(id)` (30s TTL)
 - Uncached lookups for sensitive data: `LLMConfigGet`, `BotUserGet`, `ChatThreadGet`, `AgentPresenceGet`
 - Dispatch helpers: `AgentDispatch`, `AgentLLMCallRecord`, `VideoShotCallRecord`
+- Token/host sync (v0.2.2): `IssueAgentToken`, `IssueHost` — plugins that mint agent tokens locally call these to dual-write into dock's canonical tables (fixes the polar-hosts split-brain)
 - Tenant access: `WorkspacePluginAccess(workspaceID, plugin)` — closed-by-default; root team always allowed
 - `Heartbeat` — plugin → dock liveness signal
 
