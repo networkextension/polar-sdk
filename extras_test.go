@@ -380,6 +380,133 @@ func TestIssueHost_RejectsEmptyArgs(t *testing.T) {
 	}
 }
 
+// v4 — AgentRegister + workspace-proxy-tokens/ensure + bots/create-for-agent.
+
+func TestAgentRegister_PostsAndDecodes(t *testing.T) {
+	var capturedURL, capturedBody string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		capturedURL = r.URL.Path
+		buf := make([]byte, 2048)
+		n, _ := r.Body.Read(buf)
+		capturedBody = string(buf[:n])
+		_ = json.NewEncoder(w).Encode(AgentRegisterResponse{
+			AgentID:   "ag_abcdef0123456789abcdef0123456789",
+			HostID:    "5f4dcc3b5aa765d61d8327deb882cf99",
+			BotUserID: "bot_xyz",
+			Token:     "polar_agent_raw_sample",
+			Server:    "https://zen.4950.store:2443",
+		})
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	out, err := c.AgentRegister(AgentRegisterRequest{
+		EnrollToken:    "tok_enroll_raw",
+		WorkspaceID:    "t_root",
+		Name:           "emei-kimi",
+		MachineUUIDRaw: "12345678-90AB-CDEF-1234-567890ABCDEF",
+		HostInfo: map[string]any{
+			"hw_model":        "Mac15,8",
+			"cpu_brand":       "Apple processor",
+			"cpu_cores":       16,
+			"mem_total_bytes": int64(51539607552),
+		},
+		OS:   "darwin",
+		Arch: "arm64",
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if capturedURL != "/internal/v1/agents/register" {
+		t.Fatalf("URL: got %q", capturedURL)
+	}
+	if out.AgentID != "ag_abcdef0123456789abcdef0123456789" {
+		t.Fatalf("AgentID round-trip: %+v", out)
+	}
+	if out.BotUserID != "bot_xyz" {
+		t.Fatalf("BotUserID round-trip: %+v", out)
+	}
+	if out.Token != "polar_agent_raw_sample" {
+		t.Fatalf("Token round-trip: %+v", out)
+	}
+	if out.Server == "" {
+		t.Fatalf("Server should echo, got empty: %+v", out)
+	}
+	// Body must carry the v4 fields verbatim so dock can hash + persist.
+	for _, needle := range []string{
+		`"name":"emei-kimi"`,
+		`"machine_uuid_raw":"12345678-90AB-CDEF-1234-567890ABCDEF"`,
+		`"workspace_id":"t_root"`,
+		`"hw_model":"Mac15,8"`,
+	} {
+		if !strings.Contains(capturedBody, needle) {
+			t.Errorf("body missing %q: %s", needle, capturedBody)
+		}
+	}
+}
+
+func TestAgentRegister_RejectsMissingFields(t *testing.T) {
+	c := newTestClient("http://unused")
+	if _, err := c.AgentRegister(AgentRegisterRequest{WorkspaceID: "t", MachineUUIDRaw: "u"}); err == nil {
+		t.Fatal("missing name should reject")
+	}
+	if _, err := c.AgentRegister(AgentRegisterRequest{Name: "n", MachineUUIDRaw: "u"}); err == nil {
+		t.Fatal("missing workspace_id should reject")
+	}
+	if _, err := c.AgentRegister(AgentRegisterRequest{Name: "n", WorkspaceID: "t"}); err == nil {
+		t.Fatal("missing machine_uuid_raw should reject (v4 requires it)")
+	}
+}
+
+func TestEnsureWorkspaceAgentPoolProxyToken_DefaultsName(t *testing.T) {
+	var body string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 512)
+		n, _ := r.Body.Read(buf)
+		body = string(buf[:n])
+		_ = json.NewEncoder(w).Encode(WorkspaceProxyTokenEnsureResponse{ID: 42, Created: false})
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	out, err := c.EnsureWorkspaceAgentPoolProxyToken(WorkspaceProxyTokenEnsureRequest{
+		WorkspaceID: "t_root", OwnerUserID: "u_op", // Name intentionally empty
+	})
+	if err != nil || out.ID != 42 {
+		t.Fatalf("err=%v out=%+v", err, out)
+	}
+	if !strings.Contains(body, `"name":"agent-pool"`) {
+		t.Fatalf("default name should be agent-pool: %s", body)
+	}
+}
+
+func TestCreateBotForAgent_Posts(t *testing.T) {
+	var body string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 512)
+		n, _ := r.Body.Read(buf)
+		body = string(buf[:n])
+		_ = json.NewEncoder(w).Encode(BotForAgentCreateResponse{
+			BotUserID: "bot_freshly_created",
+			Created:   true,
+		})
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+	out, err := c.CreateBotForAgent(BotForAgentCreateRequest{
+		WorkspaceID: "t_root",
+		OwnerUserID: "u_op",
+		Name:        "bot-emei-kimi-abc12345",
+		LLMConfig:   map[string]any{"proxy_token_id": int64(42)},
+	})
+	if err != nil || out.BotUserID == "" || !out.Created {
+		t.Fatalf("err=%v out=%+v", err, out)
+	}
+	for _, needle := range []string{`"name":"bot-emei-kimi-abc12345"`, `"proxy_token_id":42`} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("body missing %q: %s", needle, body)
+		}
+	}
+}
+
 func TestEmptyArgsRejected(t *testing.T) {
 	c := newTestClient("http://unused")
 	if _, err := c.UserGet(""); err == nil {

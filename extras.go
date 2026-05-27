@@ -172,12 +172,9 @@ type AgentTokenIssueResponse struct {
 // Slug is computed plugin-side to keep dock from re-running the
 // uniqueness probe.
 //
-// MachineUUID (v0.2.3) is the stable per-machine fingerprint the agent
-// collects (IOPlatformUUID / machine-id / smbios). When non-empty, dock
-// runs an upsert keyed on (workspace_id, machine_uuid) instead of the
-// default ON CONFLICT (id) DO NOTHING — re-registers from the same
-// physical box dedup onto the same hosts row across token rotations
-// + IP changes. Empty = skip dedup (legacy / collector-failed agent).
+// Deprecated: v4 splits hosts ↔ agents. See doc/arch/agent-identity-v4.md.
+// The MachineUUID field below is retained for read-side compatibility
+// while the v3-v4 cutover proceeds; new code MUST use AgentRegister.
 type HostIssueRequest struct {
 	ID           string `json:"id"`
 	WorkspaceID  string `json:"workspace_id"`
@@ -186,12 +183,131 @@ type HostIssueRequest struct {
 	AgentTokenID string `json:"agent_token_id,omitempty"`
 	OS           string `json:"os,omitempty"`
 	Arch         string `json:"arch,omitempty"`
-	MachineUUID  string `json:"machine_uuid,omitempty"`
+	// Deprecated: v4 splits hosts ↔ agents. See doc/arch/agent-identity-v4.md.
+	MachineUUID string `json:"machine_uuid,omitempty"`
 }
 
 type HostIssueResponse struct {
 	ID      string `json:"id"`
 	Deduped bool   `json:"deduped,omitempty"`
+}
+
+// ── v4 Agent identity surface ───────────────────────────────────────
+//
+// See doc/arch/agent-identity-v4.md for the full design.
+//
+// v3 conflated "physical machine" with "logical agent" via
+// hosts.machine_uuid + UNIQUE(workspace_id, machine_uuid). v4 splits:
+//
+//   hosts   = physical asset, PK = sha256(salt + raw_machine_uuid)
+//   agents  = logical agent instance, PK = ag_<random32hex>, FK → hosts
+//
+// One host : N agents. The raw machine_uuid is sent once per register
+// (hashed server-side, never persisted raw); agent.toml then persists
+// the server-issued agent_id for re-attach.
+
+// AgentRegisterRequest is the body of POST /internal/v1/agents/register.
+// Plugin-authed (HMAC) — polar-hosts calls this from its agent-facing
+// /api/hosts/register handler after consuming the enroll token. The
+// plugin does NOT pre-generate agent_id (server mints + returns it).
+//
+// Field contract:
+//   - EnrollToken       — already consumed by the calling plugin; dock
+//                         uses it only for audit ("who issued this agent_id").
+//   - Name              — operator-chosen label; UNIQUE per workspace at
+//                         the agents table level (server returns 409 on dup).
+//   - MachineUUIDRaw    — raw IOPlatformUUID / machine-id / smbios UUID.
+//                         Hashed via sha256(salt + raw) to derive host_id;
+//                         the raw value is dropped immediately and NEVER
+//                         persisted. Required for v4 (legacy "" path is
+//                         gone).
+//   - HostInfo          — hw_model / cpu_brand / cpu_cores / mem_total_bytes
+//                         / os_name / os_version / etc. UPSERT'd into the
+//                         hosts row keyed on the derived host_id.
+//   - BotUserID         — optional. When non-empty dock skips bot
+//                         auto-create and binds the agent to this
+//                         existing bot. Empty → dock auto-creates a bot
+//                         named "bot-<agent_name>-<short_id>" bound to
+//                         the workspace's agent-pool llm_proxy_token.
+type AgentRegisterRequest struct {
+	EnrollToken    string         `json:"enroll_token"`
+	WorkspaceID    string         `json:"workspace_id"`
+	Name           string         `json:"name"`
+	MachineUUIDRaw string         `json:"machine_uuid_raw"`
+	HostInfo       map[string]any `json:"host_info,omitempty"`
+	OS             string         `json:"os,omitempty"`
+	Arch           string         `json:"arch,omitempty"`
+	BotUserID      string         `json:"bot_user_id,omitempty"`
+}
+
+// AgentRegisterResponse is what /internal/v1/agents/register returns.
+//
+//   - AgentID    — server-minted "ag_<random32hex>". Persisted in
+//                  agent.toml on the polar-agent box.
+//   - HostID     — sha256(salt + raw)[:32] hex. Stable across re-installs
+//                  on the same hardware (operator backs up agent.toml,
+//                  reinstalls OS, same host_id resolves).
+//   - BotUserID  — bot the agent should attach as. Either the existing
+//                  bot the caller passed in via BotUserID, or the
+//                  freshly-auto-created one.
+//   - Token      — raw "polar_agent_<...>" auth credential. Plaintext;
+//                  shown once, agent persists it in agent.toml. Server
+//                  only retains the sha256 hash via agent_tokens.
+//   - Server     — canonical control-plane URL the agent should use for
+//                  /ws/agent (defaultServer echoed back; lets the CLI
+//                  fall back to a sane value when --server wasn't passed).
+type AgentRegisterResponse struct {
+	AgentID   string `json:"agent_id"`
+	HostID    string `json:"host_id"`
+	BotUserID string `json:"bot_user_id"`
+	Token     string `json:"token"`
+	Server    string `json:"server"`
+}
+
+// WorkspaceProxyTokenEnsureRequest mirrors POST
+// /internal/v1/workspace-proxy-tokens/ensure. Idempotent: returns the
+// existing llm_proxy_tokens row matching (WorkspaceID, Name), or
+// creates one with sensible defaults when none exists. polar-hosts'
+// registerAgent calls this with Name="agent-pool" so every
+// auto-created bot binds to one workspace-scoped proxy token (single
+// SQL groups all auto-bot LLM spend per workspace).
+type WorkspaceProxyTokenEnsureRequest struct {
+	WorkspaceID string `json:"workspace_id"`
+	OwnerUserID string `json:"owner_user_id"`
+	Name        string `json:"name"`
+}
+
+// WorkspaceProxyTokenEnsureResponse — ID is the bigserial PK of
+// llm_proxy_tokens; bot_users.llm_config_id is NOT this id (the
+// auto-created bot uses an LLM config keyed back to this token via
+// llm_configs.proxy_token_id). Created=true means we minted, false
+// means we returned an existing row.
+type WorkspaceProxyTokenEnsureResponse struct {
+	ID      int64 `json:"id"`
+	Created bool  `json:"created,omitempty"`
+}
+
+// BotForAgentCreateRequest mirrors POST
+// /internal/v1/bots/create-for-agent. Idempotent on (WorkspaceID, Name)
+// — if a bot with that name already exists in the workspace, dock
+// returns the existing row's bot_user_id rather than 409'ing.
+//
+// LLMConfig carries the upstream-binding hint (e.g.
+// {"proxy_token_id": 42}) so dock knows which llm_configs row to
+// associate the bot with. Empty map → bot is created without an
+// llm_config; the agent uses the platform default (rare; the normal
+// path is "bind to agent-pool proxy token").
+type BotForAgentCreateRequest struct {
+	WorkspaceID string         `json:"workspace_id"`
+	OwnerUserID string         `json:"owner_user_id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	LLMConfig   map[string]any `json:"llm_config,omitempty"`
+}
+
+type BotForAgentCreateResponse struct {
+	BotUserID string `json:"bot_user_id"`
+	Created   bool   `json:"created,omitempty"`
 }
 
 // VideoShotCallRecord mirrors POST /internal/v1/billing/video-shots.
@@ -544,6 +660,80 @@ func (c *Client) IssueHost(req HostIssueRequest) (*HostIssueResponse, error) {
 		return nil, err
 	}
 	var out HostIssueResponse
+	if err := readJSON(resp, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AgentRegister wraps POST /internal/v1/agents/register. See
+// AgentRegisterRequest for the v4 protocol; this is the entry point
+// polar-hosts' /api/hosts/register handler calls after consuming an
+// enroll token. Dock takes ownership of host_id derivation (hashing
+// MachineUUIDRaw with its private salt), agent_id minting, agent_token
+// + bot auto-create. Plugin only adds its own agents-table row after
+// this returns and persists the AgentID for future hello frames.
+//
+// HMAC-plugin-authed; raw machine_uuid crosses the wire but never
+// persists. If you must log this request body, scrub MachineUUIDRaw
+// before write.
+func (c *Client) AgentRegister(req AgentRegisterRequest) (*AgentRegisterResponse, error) {
+	if strings.TrimSpace(req.Name) == "" {
+		return nil, errInvalid("AgentRegister: name required")
+	}
+	if strings.TrimSpace(req.WorkspaceID) == "" {
+		return nil, errInvalid("AgentRegister: workspace_id required")
+	}
+	if strings.TrimSpace(req.MachineUUIDRaw) == "" {
+		return nil, errInvalid("AgentRegister: machine_uuid_raw required (v4)")
+	}
+	resp, err := c.Do(http.MethodPost, "/internal/v1/agents/register", req)
+	if err != nil {
+		return nil, err
+	}
+	var out AgentRegisterResponse
+	if err := readJSON(resp, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// EnsureWorkspaceAgentPoolProxyToken wraps POST
+// /internal/v1/workspace-proxy-tokens/ensure. Idempotent;
+// safe to call on every register.
+func (c *Client) EnsureWorkspaceAgentPoolProxyToken(req WorkspaceProxyTokenEnsureRequest) (*WorkspaceProxyTokenEnsureResponse, error) {
+	if strings.TrimSpace(req.WorkspaceID) == "" {
+		return nil, errInvalid("EnsureWorkspaceAgentPoolProxyToken: workspace_id required")
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		req.Name = "agent-pool"
+	}
+	resp, err := c.Do(http.MethodPost, "/internal/v1/workspace-proxy-tokens/ensure", req)
+	if err != nil {
+		return nil, err
+	}
+	var out WorkspaceProxyTokenEnsureResponse
+	if err := readJSON(resp, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateBotForAgent wraps POST /internal/v1/bots/create-for-agent.
+// Idempotent on (workspace_id, name) — if the named bot already
+// exists dock returns its existing bot_user_id with Created=false.
+func (c *Client) CreateBotForAgent(req BotForAgentCreateRequest) (*BotForAgentCreateResponse, error) {
+	if strings.TrimSpace(req.WorkspaceID) == "" {
+		return nil, errInvalid("CreateBotForAgent: workspace_id required")
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return nil, errInvalid("CreateBotForAgent: name required")
+	}
+	resp, err := c.Do(http.MethodPost, "/internal/v1/bots/create-for-agent", req)
+	if err != nil {
+		return nil, err
+	}
+	var out BotForAgentCreateResponse
 	if err := readJSON(resp, &out); err != nil {
 		return nil, err
 	}
