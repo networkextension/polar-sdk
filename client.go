@@ -200,6 +200,9 @@ func (c *Client) Heartbeat(opts HeartbeatOpts) error {
 		"uptime_seconds": opts.UptimeSeconds,
 		"metrics_url":    opts.MetricsURL,
 	}
+	if len(opts.UIRoutes) > 0 {
+		body["ui_routes"] = opts.UIRoutes
+	}
 	resp, err := c.Do(http.MethodPost, "/internal/v1/plugin-registry/heartbeat", body)
 	if err != nil {
 		return err
