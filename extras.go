@@ -171,6 +171,13 @@ type AgentTokenIssueResponse struct {
 // getHostByAgentToken (called on every /ws/agent message) resolves.
 // Slug is computed plugin-side to keep dock from re-running the
 // uniqueness probe.
+//
+// MachineUUID (v0.2.3) is the stable per-machine fingerprint the agent
+// collects (IOPlatformUUID / machine-id / smbios). When non-empty, dock
+// runs an upsert keyed on (workspace_id, machine_uuid) instead of the
+// default ON CONFLICT (id) DO NOTHING — re-registers from the same
+// physical box dedup onto the same hosts row across token rotations
+// + IP changes. Empty = skip dedup (legacy / collector-failed agent).
 type HostIssueRequest struct {
 	ID           string `json:"id"`
 	WorkspaceID  string `json:"workspace_id"`
@@ -179,6 +186,7 @@ type HostIssueRequest struct {
 	AgentTokenID string `json:"agent_token_id,omitempty"`
 	OS           string `json:"os,omitempty"`
 	Arch         string `json:"arch,omitempty"`
+	MachineUUID  string `json:"machine_uuid,omitempty"`
 }
 
 type HostIssueResponse struct {
