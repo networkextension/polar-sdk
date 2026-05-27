@@ -390,11 +390,11 @@ func TestAgentRegister_PostsAndDecodes(t *testing.T) {
 		n, _ := r.Body.Read(buf)
 		capturedBody = string(buf[:n])
 		_ = json.NewEncoder(w).Encode(AgentRegisterResponse{
-			AgentID:   "ag_abcdef0123456789abcdef0123456789",
-			HostID:    "5f4dcc3b5aa765d61d8327deb882cf99",
-			BotUserID: "bot_xyz",
-			Token:     "polar_agent_raw_sample",
-			Server:    "https://zen.4950.store:2443",
+			AgentID:       "ag_abcdef0123456789abcdef0123456789",
+			HostID:        "5f4dcc3b5aa765d61d8327deb882cf99",
+			BotUserID:     "bot_xyz",
+			AgentTokenRaw: "polar_agent_raw_sample",
+			Server:        "https://zen.4950.store:2443",
 		})
 	})
 	defer srv.Close()
@@ -425,8 +425,8 @@ func TestAgentRegister_PostsAndDecodes(t *testing.T) {
 	if out.BotUserID != "bot_xyz" {
 		t.Fatalf("BotUserID round-trip: %+v", out)
 	}
-	if out.Token != "polar_agent_raw_sample" {
-		t.Fatalf("Token round-trip: %+v", out)
+	if out.AgentTokenRaw != "polar_agent_raw_sample" {
+		t.Fatalf("AgentTokenRaw round-trip: %+v", out)
 	}
 	if out.Server == "" {
 		t.Fatalf("Server should echo, got empty: %+v", out)
