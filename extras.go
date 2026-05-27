@@ -250,18 +250,23 @@ type AgentRegisterRequest struct {
 //   - BotUserID  — bot the agent should attach as. Either the existing
 //                  bot the caller passed in via BotUserID, or the
 //                  freshly-auto-created one.
-//   - Token      — raw "polar_agent_<...>" auth credential. Plaintext;
+//   - AgentTokenRaw — raw "polar_agent_<...>" auth credential. Plaintext;
 //                  shown once, agent persists it in agent.toml. Server
-//                  only retains the sha256 hash via agent_tokens.
+//                  only retains the sha256 hash via agent_tokens. JSON
+//                  wire tag is "agent_token_raw" to match the public
+//                  polar-hosts /api/hosts/register response shape — that
+//                  endpoint is what polar-agent CLI parses, so the SDK
+//                  uses the same name (rather than the older "token"
+//                  which left two field names for one value).
 //   - Server     — canonical control-plane URL the agent should use for
 //                  /ws/agent (defaultServer echoed back; lets the CLI
 //                  fall back to a sane value when --server wasn't passed).
 type AgentRegisterResponse struct {
-	AgentID   string `json:"agent_id"`
-	HostID    string `json:"host_id"`
-	BotUserID string `json:"bot_user_id"`
-	Token     string `json:"token"`
-	Server    string `json:"server"`
+	AgentID       string `json:"agent_id"`
+	HostID        string `json:"host_id"`
+	BotUserID     string `json:"bot_user_id"`
+	AgentTokenRaw string `json:"agent_token_raw"`
+	Server        string `json:"server"`
 }
 
 // WorkspaceProxyTokenEnsureRequest mirrors POST
