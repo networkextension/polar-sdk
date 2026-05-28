@@ -537,6 +537,135 @@ func TestEmptyArgsRejected(t *testing.T) {
 // newSignedServer wraps an httptest server that does NOT verify the
 // HMAC signature (these wrappers' job is to construct + send, not to
 // re-test the signing scheme that client_test.go already covers).
+func TestAssetGet_HitsByNameWithQuery(t *testing.T) {
+	var seenPath string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path + "?" + r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(AssetMeta{
+			ID: 42, Kind: "model", Name: "qwen3/7b", Version: "v1",
+			SHA256: "abc123", SizeBytes: 1024,
+		})
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	ws := "t_root"
+	m, err := c.AssetGet(&ws, "model", "qwen3/7b", "v1")
+	if err != nil {
+		t.Fatalf("AssetGet err: %v", err)
+	}
+	if m.ID != 42 || m.Kind != "model" || m.SHA256 != "abc123" {
+		t.Fatalf("unexpected meta: %+v", m)
+	}
+	want := "/internal/v1/assets/by-name?kind=model&name=qwen3%2F7b&version=v1&workspace_id=t_root"
+	if seenPath != want {
+		t.Fatalf("path/query mismatch:\n got %q\nwant %q", seenPath, want)
+	}
+}
+
+func TestAssetGet_DefaultsVersion(t *testing.T) {
+	var seenRawQuery string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenRawQuery = r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(AssetMeta{ID: 1, Version: "v1"})
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	if _, err := c.AssetGet(nil, "package", "polar-agent/darwin-arm64", ""); err != nil {
+		t.Fatalf("AssetGet: %v", err)
+	}
+	if !strings.Contains(seenRawQuery, "version=v1") {
+		t.Fatalf("expected version=v1 default in query, got %q", seenRawQuery)
+	}
+	if strings.Contains(seenRawQuery, "workspace_id=") {
+		t.Fatalf("expected no workspace_id for nil arg, got %q", seenRawQuery)
+	}
+}
+
+func TestAssetStat_HitsBySHA256Path(t *testing.T) {
+	var seenPath string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		_ = json.NewEncoder(w).Encode(AssetMeta{ID: 99, SHA256: strings.TrimPrefix(r.URL.Path, "/internal/v1/assets/by-sha256/")})
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	m, err := c.AssetStat("deadbeef1234")
+	if err != nil {
+		t.Fatalf("AssetStat err: %v", err)
+	}
+	if seenPath != "/internal/v1/assets/by-sha256/deadbeef1234" {
+		t.Fatalf("wrong path: %q", seenPath)
+	}
+	if m.SHA256 != "deadbeef1234" {
+		t.Fatalf("wrong sha: %q", m.SHA256)
+	}
+}
+
+func TestAssetDelete_HitsDeleteByID(t *testing.T) {
+	var seenMethod, seenPath string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenMethod, seenPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	if err := c.AssetDelete(42); err != nil {
+		t.Fatalf("AssetDelete: %v", err)
+	}
+	if seenMethod != http.MethodDelete {
+		t.Fatalf("wrong method: %q", seenMethod)
+	}
+	if seenPath != "/internal/v1/assets/42" {
+		t.Fatalf("wrong path: %q", seenPath)
+	}
+}
+
+func TestAssetDelete_RejectsBadID(t *testing.T) {
+	c := newTestClient("http://example.invalid")
+	for _, id := range []int64{0, -1, -999} {
+		if err := c.AssetDelete(id); err == nil {
+			t.Errorf("expected error for id=%d, got nil", id)
+		}
+	}
+}
+
+func TestAssetDownload_StreamsBlob(t *testing.T) {
+	payload := []byte("the quick brown fox over the lazy dog")
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/assets/7/blob" {
+			t.Errorf("unexpected path: %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(payload)
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	resp, err := c.AssetDownload(&AssetMeta{ID: 7, SHA256: "x"})
+	if err != nil {
+		t.Fatalf("AssetDownload: %v", err)
+	}
+	defer resp.Body.Close()
+	got := make([]byte, 1024)
+	n, _ := resp.Body.Read(got)
+	if string(got[:n]) != string(payload) {
+		t.Fatalf("body mismatch: got %q want %q", got[:n], payload)
+	}
+}
+
+func TestAssetUpload_StillStub(t *testing.T) {
+	c := newTestClient("http://unused.invalid")
+	_, err := c.AssetUpload(AssetUploadInput{Kind: "model", Name: "x"}, strings.NewReader("body"))
+	if err != ErrAssetUploadNotImplemented {
+		t.Fatalf("expected ErrAssetUploadNotImplemented, got: %v", err)
+	}
+}
+
 func newSignedServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
