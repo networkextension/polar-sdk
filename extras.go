@@ -16,6 +16,8 @@
 package sdk
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -750,3 +752,163 @@ func errInvalid(msg string) error { return &invalidErr{msg: msg} }
 type invalidErr struct{ msg string }
 
 func (e *invalidErr) Error() string { return e.msg }
+
+// ── Assets ──────────────────────────────────────────────────────────
+//
+// The Polar assets module is a unified file/object store: platform
+// internals (LLM weights, polar-agent binaries) live alongside tenant
+// uploads (S3-style backing store, link-share, team-share, media
+// migration target). Dock owns the catalog + router; the actual blob
+// bytes are served by `polar-assets-svc` provider plugins, one per
+// region. See doc/arch/assets-module.md.
+//
+// Plugins call these wrappers when they need to fetch a model file,
+// stat a known sha256, or eventually upload an artifact (e.g. video
+// modules migrating generated MP4s into the central store).
+//
+// Cache: none. Asset metadata can change (visibility flipped, asset
+// deleted, pinned toggled) and stale "OK" answers are operationally
+// scary in a permission-gated store.
+
+// AssetMeta mirrors the row shape returned by GET
+// /internal/v1/assets/by-name and GET /internal/v1/assets/:id.
+// WorkspaceID is nil for platform-owned assets.
+type AssetMeta struct {
+	ID          int64          `json:"id"`
+	WorkspaceID *string        `json:"workspace_id,omitempty"`
+	Kind        string         `json:"kind"`
+	Name        string         `json:"name"`
+	Version     string         `json:"version"`
+	SHA256      string         `json:"sha256"`
+	SizeBytes   int64          `json:"size_bytes"`
+	Mime        string         `json:"mime"`
+	Visibility  string         `json:"visibility"`
+	SourceURL   *string        `json:"source_url,omitempty"`
+	UploadedBy  string         `json:"uploaded_by"`
+	Pinned      bool           `json:"pinned"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+	CreatedAt   string         `json:"created_at"`
+	UpdatedAt   string         `json:"updated_at"`
+}
+
+// AssetUploadInput is the write-side shape passed to AssetUpload.
+// Body is delivered separately as an io.Reader so callers can stream
+// large blobs without keeping them in memory.
+//
+// WorkspaceID nil = "platform asset" (admin-only at the server gate).
+// SourceURL is provenance only — recorded so future humans know where
+// the bytes came from; never auto-fetched.
+type AssetUploadInput struct {
+	WorkspaceID *string        `json:"workspace_id,omitempty"`
+	Kind        string         `json:"kind"`    // model|package|lib|media|app_data
+	Name        string         `json:"name"`    // path-like
+	Version     string         `json:"version"` // default "v1" if empty
+	Visibility  string         `json:"visibility,omitempty"`
+	SourceURL   string         `json:"source_url,omitempty"`
+	Mime        string         `json:"mime,omitempty"`
+	Pinned      bool           `json:"pinned,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+}
+
+// AssetListResponse wraps GET /internal/v1/assets list responses.
+type AssetListResponse struct {
+	Assets []AssetMeta `json:"assets"`
+}
+
+// AssetGet looks up a single asset by composite key. workspaceID is
+// nil for platform assets ("" string is treated as nil to match the
+// SQL UNIQUE NULLS NOT DISTINCT semantics).
+func (c *Client) AssetGet(workspaceID *string, kind, name, version string) (*AssetMeta, error) {
+	if strings.TrimSpace(kind) == "" {
+		return nil, errInvalid("AssetGet: kind required")
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, errInvalid("AssetGet: name required")
+	}
+	if strings.TrimSpace(version) == "" {
+		version = "v1"
+	}
+	q := url.Values{}
+	q.Set("kind", kind)
+	q.Set("name", name)
+	q.Set("version", version)
+	if workspaceID != nil && *workspaceID != "" {
+		q.Set("workspace_id", *workspaceID)
+	}
+	resp, err := c.Do(http.MethodGet, "/internal/v1/assets/by-name?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out AssetMeta
+	if err := readJSON(resp, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AssetStat looks up an asset by its content hash. Useful when a caller
+// already knows the sha256 (e.g. recorded in some downstream table) and
+// wants the canonical metadata without re-deriving name/version.
+func (c *Client) AssetStat(sha256 string) (*AssetMeta, error) {
+	if strings.TrimSpace(sha256) == "" {
+		return nil, errInvalid("AssetStat: sha256 required")
+	}
+	resp, err := c.Do(http.MethodGet, "/internal/v1/assets/by-sha256/"+sha256, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out AssetMeta
+	if err := readJSON(resp, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AssetDelete removes the catalog row + cascades to share_links +
+// asks each provider to drop the blob. Returns nil on 200; an error
+// on any non-2xx (including 404 for already-gone, which callers may
+// want to treat as success — caller's choice).
+func (c *Client) AssetDelete(id int64) error {
+	if id <= 0 {
+		return errInvalid("AssetDelete: id must be > 0")
+	}
+	resp, err := c.Do(http.MethodDelete, "/internal/v1/assets/"+strconv.FormatInt(id, 10), nil)
+	if err != nil {
+		return err
+	}
+	return readJSON(resp, nil)
+}
+
+// AssetDownload returns an open *http.Response whose Body streams the
+// blob bytes. Caller owns the body lifecycle — MUST defer Close().
+// The server's content-type and content-length headers are preserved.
+//
+// For sha256 verification, prefer wrapping resp.Body in a sha256
+// hasher and comparing against ref.SHA256 as bytes flow — don't trust
+// the catalog alone for tamper detection.
+func (c *Client) AssetDownload(ref *AssetMeta) (*http.Response, error) {
+	if ref == nil || ref.ID <= 0 {
+		return nil, errInvalid("AssetDownload: ref.ID required")
+	}
+	return c.Do(http.MethodGet, "/internal/v1/assets/"+strconv.FormatInt(ref.ID, 10)+"/blob", nil)
+}
+
+// AssetUpload is the write-side counterpart. NOT YET IMPLEMENTED in v0.3.0
+// — the multipart wire is intentionally deferred until the first real
+// consumer (likely polar-video's P11 migration). The signature is fixed
+// now so downstream code can declare its dependency; calls return
+// ErrAssetUploadNotImplemented until the body wires up.
+//
+// When implemented, this will POST to /internal/v1/assets/upload with
+// a streaming multipart body (one "meta" JSON field + one "file" file
+// field). For now: stub.
+func (c *Client) AssetUpload(input AssetUploadInput, body io.Reader) (*AssetMeta, error) {
+	_ = input
+	_ = body
+	return nil, ErrAssetUploadNotImplemented
+}
+
+// ErrAssetUploadNotImplemented signals the deferred-impl state of
+// AssetUpload (v0.3.0). Callers should branch on this so they can
+// gracefully fall back / wait for v0.4.0 without crashing.
+var ErrAssetUploadNotImplemented = errors.New("sdk.AssetUpload: not implemented in v0.3.0; lands with the first SDK consumer (polar-video P11)")
