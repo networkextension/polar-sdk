@@ -8,6 +8,12 @@ package sdk
 // image, and exits. A launchd/systemd supervisor with KeepAlive then
 // restarts the process on the new binary — no dock→plugin push channel.
 //
+// The exit is deliberately NON-ZERO (ExitCodeSelfUpdated). launchd's common
+// `KeepAlive={SuccessfulExit=false}` only restarts a job that exits
+// unsuccessfully, so a clean exit(0) after the swap would leave the module
+// down. A non-zero code restarts under BOTH that config and plain
+// `KeepAlive=true`; systemd `Restart=always`/`on-failure` likewise.
+//
 // SelfUpdate is deliberately blunt and opt-in: callers gate it behind their
 // own env flag (e.g. POLAR_SELF_UPDATE=1) so a compromised/buggy dock can
 // never move a binary that the operator didn't arm.
@@ -25,10 +31,16 @@ import (
 	"time"
 )
 
+// ExitCodeSelfUpdated is the process exit code SelfUpdate uses after a
+// successful swap. It is non-zero on purpose so a KeepAlive supervisor
+// restarts the process on the new binary (see the package comment); it's
+// also greppable in logs to distinguish an OTA restart from a crash.
+const ExitCodeSelfUpdated = 42
+
 // SelfUpdate downloads the binary named by d, verifies it against d.SHA256,
-// atomically replaces the file at binPath, and then calls os.Exit(0) so the
-// supervisor restarts the process on the new binary. It does NOT return on
-// success.
+// atomically replaces the file at binPath, and then exits the process with
+// ExitCodeSelfUpdated (non-zero) so the supervisor restarts it on the new
+// binary. It does NOT return on success.
 //
 // On any failure before the swap (download error, sha mismatch, write/rename
 // error) it returns a non-nil error and leaves binPath untouched, so the
@@ -112,8 +124,8 @@ func SelfUpdate(d *UpdateDirective, binPath string) error {
 	}
 	cleanup = false // tmp is now binPath
 
-	fmt.Fprintf(os.Stderr, "sdk.SelfUpdate: swapped %s -> version %s (sha %s); exiting for supervisor restart\n", binPath, d.Version, got)
-	os.Exit(0)
+	fmt.Fprintf(os.Stderr, "sdk.SelfUpdate: swapped %s -> version %s (sha %s); exiting %d for supervisor restart\n", binPath, d.Version, got, ExitCodeSelfUpdated)
+	os.Exit(ExitCodeSelfUpdated)
 	return nil // unreachable
 }
 
