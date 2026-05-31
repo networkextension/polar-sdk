@@ -254,6 +254,13 @@ func (c *Client) HeartbeatV2(opts HeartbeatOpts) (*HeartbeatResult, error) {
 			return nil, fmt.Errorf("heartbeat decode: %w", err)
 		}
 	}
+	// Dock returns the update URL as a dock-relative path so the module
+	// pulls the binary over the same base it heartbeats on (avoids any
+	// public-vs-internal hostname mismatch behind a reverse proxy).
+	// Resolve it here against DockBase so SelfUpdate gets an absolute URL.
+	if out.Update != nil && strings.HasPrefix(out.Update.URL, "/") {
+		out.Update.URL = c.DockBase + out.Update.URL
+	}
 	return &out, nil
 }
 
