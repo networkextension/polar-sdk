@@ -86,6 +86,29 @@ type HeartbeatOpts struct {
 	UptimeSeconds int64     `json:"uptime_seconds,omitempty"`
 	MetricsURL    string    `json:"metrics_url,omitempty"`
 	UIRoutes      []UIRoute `json:"ui_routes,omitempty"`
+
+	// OS/Arch identify which prebuilt binary this instance runs, so dock
+	// can hand back a matching OTA update directive (see HeartbeatV2).
+	// Callers pass runtime.GOOS / runtime.GOARCH.
+	OS   string `json:"os,omitempty"`
+	Arch string `json:"arch,omitempty"`
+}
+
+// HeartbeatResult is dock's heartbeat response. Update is non-nil when dock
+// wants this plugin to roll its binary to a different version (OTA pull
+// model — Track 3 of the module-platform plan). Old dock builds return an
+// empty body, which decodes to a zero HeartbeatResult (Update == nil).
+type HeartbeatResult struct {
+	Update *UpdateDirective `json:"update,omitempty"`
+}
+
+// UpdateDirective instructs the plugin to self-update: fetch the binary at
+// URL, verify it against SHA256 (hex), then swap + restart. Consumed by
+// SelfUpdate.
+type UpdateDirective struct {
+	Version string `json:"version"`
+	URL     string `json:"url"`
+	SHA256  string `json:"sha256"`
 }
 
 // NewClient builds a Client with a sane default HTTP timeout (15s).
@@ -189,25 +212,56 @@ func (c *Client) AuthVerify(token string) (*AuthVerifyResult, error) {
 	return &out, nil
 }
 
-// Heartbeat pings dock to refresh last_heartbeat + version + endpoint.
-// Call once at startup and on a timer (every 60s is the recommended
-// cadence — dock's GC sweeps stale plugins after 5m).
+// Heartbeat pings dock to refresh last_heartbeat + version + endpoint,
+// discarding dock's response. Call once at startup and on a timer (every
+// 60s is the recommended cadence — dock's GC sweeps stale plugins after
+// 5m). Modules that want OTA self-update call HeartbeatV2 instead.
 func (c *Client) Heartbeat(opts HeartbeatOpts) error {
+	_, err := c.HeartbeatV2(opts)
+	return err
+}
+
+// HeartbeatV2 is Heartbeat that also returns dock's response, including any
+// OTA update directive (Result.Update). It is wire-compatible with the
+// legacy heartbeat: a dock build that returns an empty body yields a zero
+// HeartbeatResult (Update == nil), so callers can adopt it without a dock
+// upgrade. Pair with SelfUpdate to act on a non-nil Update.
+func (c *Client) HeartbeatV2(opts HeartbeatOpts) (*HeartbeatResult, error) {
 	body := map[string]any{
 		"name":           c.PluginName,
 		"version":        opts.Version,
 		"endpoint":       opts.Endpoint,
 		"uptime_seconds": opts.UptimeSeconds,
 		"metrics_url":    opts.MetricsURL,
+		"os":             opts.OS,
+		"arch":           opts.Arch,
 	}
 	if len(opts.UIRoutes) > 0 {
 		body["ui_routes"] = opts.UIRoutes
 	}
 	resp, err := c.Do(http.MethodPost, "/internal/v1/plugin-registry/heartbeat", body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return readJSON(resp, nil)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("heartbeat HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out HeartbeatResult
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("heartbeat decode: %w", err)
+		}
+	}
+	// Dock returns the update URL as a dock-relative path so the module
+	// pulls the binary over the same base it heartbeats on (avoids any
+	// public-vs-internal hostname mismatch behind a reverse proxy).
+	// Resolve it here against DockBase so SelfUpdate gets an absolute URL.
+	if out.Update != nil && strings.HasPrefix(out.Update.URL, "/") {
+		out.Update.URL = c.DockBase + out.Update.URL
+	}
+	return &out, nil
 }
 
 // DeriveHMACKey turns the plaintext token dock printed at plugin
