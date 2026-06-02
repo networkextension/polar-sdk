@@ -19,6 +19,7 @@ package sdk
 // never move a binary that the operator didn't arm.
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -109,6 +111,20 @@ func SelfUpdate(d *UpdateDirective, binPath string) error {
 	if got != want {
 		return fmt.Errorf("sdk.SelfUpdate: sha256 mismatch: got %s want %s", got, want)
 	}
+
+	// Authenticity gate. sha256 above proves integrity (the bytes match the
+	// hash dock named); ed25519 proves the RELEASE service blessed those
+	// bytes, so a compromised storage provider can't serve a malicious
+	// binary even with a matching hash. Enforced only when the operator
+	// pins the release public key via POLAR_RELEASE_PUBKEY — fail-closed:
+	// with the key pinned, a directive lacking a valid signature is
+	// rejected (the binary is NOT swapped). Unset → sha256-only, as before.
+	if pub := strings.TrimSpace(os.Getenv("POLAR_RELEASE_PUBKEY")); pub != "" {
+		if err := verifyReleaseSignature(d, pub); err != nil {
+			return fmt.Errorf("sdk.SelfUpdate: %w", err)
+		}
+	}
+
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return fmt.Errorf("sdk.SelfUpdate: chmod temp: %w", err)
 	}
@@ -127,6 +143,63 @@ func SelfUpdate(d *UpdateDirective, binPath string) error {
 	fmt.Fprintf(os.Stderr, "sdk.SelfUpdate: swapped %s -> version %s (sha %s); exiting %d for supervisor restart\n", binPath, d.Version, got, ExitCodeSelfUpdated)
 	os.Exit(ExitCodeSelfUpdated)
 	return nil // unreachable
+}
+
+// ReleaseManifest mirrors polar-release's signed manifest. It travels in
+// the OTA directive (Manifest) so a self-updating module can reconstruct
+// the exact bytes the release service signed and verify the signature.
+// Field order + tags match polar-release/internal/release/manifest.go.
+type ReleaseManifest struct {
+	Module   string `json:"module"`
+	Version  string `json:"version"`
+	Channel  string `json:"channel"`
+	Platform string `json:"platform"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size"`
+	MinHost  string `json:"min_host,omitempty"`
+	Notes    string `json:"notes,omitempty"`
+}
+
+// canonicalBytes reproduces polar-release's signing input EXACTLY. Any
+// drift here silently breaks verification, so keep it byte-for-byte in
+// lockstep with release's Manifest.canonicalBytes (notes are NOT signed).
+func (m ReleaseManifest) canonicalBytes() []byte {
+	return []byte("polar-release/v1\n" +
+		"module=" + m.Module + "\n" +
+		"version=" + m.Version + "\n" +
+		"channel=" + m.Channel + "\n" +
+		"platform=" + m.Platform + "\n" +
+		"sha256=" + m.SHA256 + "\n" +
+		"size=" + strconv.FormatInt(m.Size, 10) + "\n" +
+		"min_host=" + m.MinHost + "\n")
+}
+
+// verifyReleaseSignature checks the directive's ed25519 signature over its
+// manifest against the pinned public key (hex). It also cross-checks that
+// the manifest's sha256/version agree with the directive, so the signature
+// can't cover different bytes than the ones being installed.
+func verifyReleaseSignature(d *UpdateDirective, pubHex string) error {
+	if d.Manifest == nil {
+		return errors.New("ed25519 verify: directive has no manifest (release key is pinned)")
+	}
+	if strings.TrimSpace(d.Ed25519Sig) == "" {
+		return errors.New("ed25519 verify: directive has no signature (release key is pinned)")
+	}
+	if !strings.EqualFold(d.Manifest.SHA256, strings.TrimSpace(d.SHA256)) {
+		return fmt.Errorf("ed25519 verify: manifest sha256 != directive sha256")
+	}
+	pub, err := hex.DecodeString(strings.TrimSpace(pubHex))
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return errors.New("ed25519 verify: POLAR_RELEASE_PUBKEY is not a valid ed25519 public key")
+	}
+	sig, err := hex.DecodeString(strings.TrimSpace(d.Ed25519Sig))
+	if err != nil {
+		return errors.New("ed25519 verify: signature not hex")
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub), d.Manifest.canonicalBytes(), sig) {
+		return errors.New("ed25519 verify: signature does not match release public key")
+	}
+	return nil
 }
 
 // copyFile copies src to dst (0755), truncating dst. Used for the .bak
