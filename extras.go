@@ -267,12 +267,21 @@ type AgentRegisterRequest struct {
 //   - Server     — canonical control-plane URL the agent should use for
 //                  /ws/agent (defaultServer echoed back; lets the CLI
 //                  fall back to a sane value when --server wasn't passed).
+//   - ProxyToken / ProxyBaseURL / DefaultModel — the agent's per-agent
+//                  LLM proxy credential (named agent:<id>) + the dock
+//                  proxy origin (…/api/proxy/v1) + the workspace default
+//                  model. Lets the agent call dock's billed/audited LLM
+//                  proxy directly for its own (non-dispatched) calls.
+//                  Plaintext shown once; persist alongside AgentTokenRaw.
 type AgentRegisterResponse struct {
 	AgentID       string `json:"agent_id"`
 	HostID        string `json:"host_id"`
 	BotUserID     string `json:"bot_user_id"`
 	AgentTokenRaw string `json:"agent_token_raw"`
 	Server        string `json:"server"`
+	ProxyToken    string `json:"proxy_token,omitempty"`
+	ProxyBaseURL  string `json:"proxy_base_url,omitempty"`
+	DefaultModel  string `json:"default_model,omitempty"`
 }
 
 // WorkspaceProxyTokenEnsureRequest mirrors POST
