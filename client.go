@@ -109,6 +109,13 @@ type UpdateDirective struct {
 	Version string `json:"version"`
 	URL     string `json:"url"`
 	SHA256  string `json:"sha256"`
+
+	// Authenticity (release-backed OTA). When dock resolves the update via
+	// polar-release it includes the ed25519 signature + the signed manifest;
+	// SelfUpdate verifies them against POLAR_RELEASE_PUBKEY when that key is
+	// pinned. Empty on the legacy through-dock path (sha256-only).
+	Ed25519Sig string           `json:"ed25519_sig,omitempty"`
+	Manifest   *ReleaseManifest `json:"manifest,omitempty"`
 }
 
 // NewClient builds a Client with a sane default HTTP timeout (15s).
