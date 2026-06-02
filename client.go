@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -189,20 +190,36 @@ func readJSON(resp *http.Response, out any) error {
 }
 
 // AuthVerify resolves an end-user session token via dock. Cached for
-// 30 seconds per the v1 spec.
+// 30 seconds per the v1 spec. Returns the user's personal workspace.
 func (c *Client) AuthVerify(token string) (*AuthVerifyResult, error) {
-	if strings.TrimSpace(token) == "" {
+	return c.AuthVerifyWS(token, "")
+}
+
+// AuthVerifyWS is AuthVerify with an active-workspace hint: pass the
+// browser's X-Workspace-Id so dock resolves WorkspaceID to the caller's
+// SELECTED workspace (when they're a member) instead of the personal
+// default. Empty workspaceID behaves exactly like AuthVerify. Cached 30s
+// per (token, workspaceID).
+func (c *Client) AuthVerifyWS(token, workspaceID string) (*AuthVerifyResult, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
 		return nil, errors.New("AuthVerify: empty token")
 	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	key := token + "\x00" + workspaceID
 	c.authMu.Lock()
-	if entry, ok := c.authCache[token]; ok && time.Since(entry.storeAt) < 30*time.Second {
+	if entry, ok := c.authCache[key]; ok && time.Since(entry.storeAt) < 30*time.Second {
 		c.authMu.Unlock()
 		res := entry.res
 		return &res, nil
 	}
 	c.authMu.Unlock()
 
-	resp, err := c.Do(http.MethodGet, "/internal/v1/auth/verify?token="+token, nil)
+	path := "/internal/v1/auth/verify?token=" + url.QueryEscape(token)
+	if workspaceID != "" {
+		path += "&workspace_id=" + url.QueryEscape(workspaceID)
+	}
+	resp, err := c.Do(http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +228,7 @@ func (c *Client) AuthVerify(token string) (*AuthVerifyResult, error) {
 		return nil, err
 	}
 	c.authMu.Lock()
-	c.authCache[token] = authCacheEntry{res: out, storeAt: time.Now()}
+	c.authCache[key] = authCacheEntry{res: out, storeAt: time.Now()}
 	// Cheap GC: when the cache passes 1000 entries, drop anything
 	// older than the 30s window. Hot prod will see way fewer than
 	// that; this is just to keep a misbehaving caller from leaking.
