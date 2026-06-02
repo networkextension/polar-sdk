@@ -16,10 +16,14 @@
 package sdk
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -879,36 +883,182 @@ func (c *Client) AssetDelete(id int64) error {
 	return readJSON(resp, nil)
 }
 
+// blobHTTPClient streams blob bytes directly to/from a provider via a
+// dock-signed URL. No timeout — blobs can be large; the dock-call
+// client (c.HTTP, 15s) is only for the small grant/finalize JSON hops.
+var blobHTTPClient = &http.Client{}
+
 // AssetDownload returns an open *http.Response whose Body streams the
 // blob bytes. Caller owns the body lifecycle — MUST defer Close().
-// The server's content-type and content-length headers are preserved.
 //
-// For sha256 verification, prefer wrapping resp.Body in a sha256
-// hasher and comparing against ref.SHA256 as bytes flow — don't trust
-// the catalog alone for tamper detection.
+// Direct path (v0.6.0): it first asks dock for a short-lived signed
+// provider URL (GET /assets/:id/download-url) and streams the blob
+// straight from the provider — the bytes never traverse dock. If the
+// dock has providers disabled (503) it falls back to the through-dock
+// blob stream, so callers work in both deployments.
+//
+// For sha256 verification, wrap resp.Body in a sha256 hasher and
+// compare against ref.SHA256 as bytes flow — don't trust the catalog
+// alone for tamper detection.
 func (c *Client) AssetDownload(ref *AssetMeta) (*http.Response, error) {
 	if ref == nil || ref.ID <= 0 {
 		return nil, errInvalid("AssetDownload: ref.ID required")
 	}
-	return c.Do(http.MethodGet, "/internal/v1/assets/"+strconv.FormatInt(ref.ID, 10)+"/blob", nil)
+	idStr := strconv.FormatInt(ref.ID, 10)
+
+	// Try the direct (dock-bypassing) path first.
+	resp, err := c.Do(http.MethodGet, "/internal/v1/assets/"+idStr+"/download-url", nil)
+	if err == nil && resp.StatusCode/100 == 2 {
+		var grant struct {
+			URL string `json:"url"`
+		}
+		if jerr := readJSON(resp, &grant); jerr == nil && grant.URL != "" {
+			req, rerr := http.NewRequest(http.MethodGet, grant.URL, nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			return blobHTTPClient.Do(req)
+		}
+	} else if resp != nil {
+		resp.Body.Close()
+	}
+
+	// Fallback: stream through dock (provider mode off, or grant path
+	// unavailable on an older dock).
+	return c.Do(http.MethodGet, "/internal/v1/assets/"+idStr+"/blob", nil)
 }
 
-// AssetUpload is the write-side counterpart. NOT YET IMPLEMENTED in v0.3.0
-// — the multipart wire is intentionally deferred until the first real
-// consumer (likely polar-video's P11 migration). The signature is fixed
-// now so downstream code can declare its dependency; calls return
-// ErrAssetUploadNotImplemented until the body wires up.
+// assetUploadGrantResp mirrors POST /internal/v1/assets/upload-grant.
+type assetUploadGrantResp struct {
+	AssetID    int64  `json:"asset_id"`
+	SHA256     string `json:"sha256"`
+	Exists     bool   `json:"exists"`
+	PutURL     string `json:"put_url"`
+	ProviderID int64  `json:"provider_id"`
+}
+
+// AssetUpload registers bytes in the assets catalog via the direct,
+// dock-bypassing signed-PUT path (doc/arch/release-system.md):
 //
-// When implemented, this will POST to /internal/v1/assets/upload with
-// a streaming multipart body (one "meta" JSON field + one "file" file
-// field). For now: stub.
+//  1. spool `body` to a temp file while computing sha256 + size
+//     (sha is the content-addressed key, so it must be known first);
+//  2. POST /assets/upload-grant → {asset_id, put_url} (or exists);
+//  3. PUT the bytes straight to the provider's signed URL — dock never
+//     sees them;
+//  4. POST /assets/finalize → mark the blob ready + bump usage.
+//
+// Pass input.WorkspaceID = nil for a platform-owned asset (module
+// binary / release artifact / model weights): no tenant quota, public
+// by default. Returns the catalog AssetMeta.
 func (c *Client) AssetUpload(input AssetUploadInput, body io.Reader) (*AssetMeta, error) {
-	_ = input
-	_ = body
-	return nil, ErrAssetUploadNotImplemented
+	if strings.TrimSpace(input.Kind) == "" || strings.TrimSpace(input.Name) == "" {
+		return nil, errInvalid("AssetUpload: kind + name required")
+	}
+	if body == nil {
+		return nil, errInvalid("AssetUpload: body required")
+	}
+	if input.Version == "" {
+		input.Version = "v1"
+	}
+	mime := input.Mime
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+
+	// 1. Spool to temp while hashing + sizing.
+	tmp, err := os.CreateTemp("", "polar-asset-*.upload")
+	if err != nil {
+		return nil, fmt.Errorf("AssetUpload: temp: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(tmp, h), body)
+	if err != nil {
+		return nil, fmt.Errorf("AssetUpload: spool: %w", err)
+	}
+	if size == 0 {
+		return nil, errInvalid("AssetUpload: empty body")
+	}
+	sha := hex.EncodeToString(h.Sum(nil))
+
+	// 2. Ask dock for a grant.
+	ws := ""
+	if input.WorkspaceID != nil {
+		ws = *input.WorkspaceID
+	}
+	grantBody := map[string]any{
+		"workspace_id": ws,
+		"kind":         input.Kind,
+		"name":         input.Name,
+		"version":      input.Version,
+		"sha256":       sha,
+		"size_bytes":   size,
+		"mime":         mime,
+		"visibility":   input.Visibility,
+		"pinned":       input.Pinned,
+		"source_url":   input.SourceURL,
+		"metadata":     input.Metadata,
+	}
+	resp, err := c.Do(http.MethodPost, "/internal/v1/assets/upload-grant", grantBody)
+	if err != nil {
+		return nil, fmt.Errorf("AssetUpload: grant: %w", err)
+	}
+	var grant assetUploadGrantResp
+	if err := readJSON(resp, &grant); err != nil {
+		return nil, fmt.Errorf("AssetUpload: grant: %w", err)
+	}
+
+	// 3. PUT bytes direct to the provider — unless the content already
+	//    exists (dedup), in which case skip straight to the metadata.
+	if !grant.Exists && grant.PutURL != "" {
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("AssetUpload: rewind: %w", err)
+		}
+		req, err := http.NewRequest(http.MethodPut, grant.PutURL, tmp)
+		if err != nil {
+			return nil, fmt.Errorf("AssetUpload: put req: %w", err)
+		}
+		req.Header.Set("Content-Type", mime)
+		req.ContentLength = size
+		putResp, err := blobHTTPClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("AssetUpload: put: %w", err)
+		}
+		if err := readJSON(putResp, nil); err != nil {
+			return nil, fmt.Errorf("AssetUpload: put: %w", err)
+		}
+
+		// 4. Finalize: mark ready + bump usage.
+		finResp, err := c.Do(http.MethodPost, "/internal/v1/assets/finalize", map[string]any{
+			"asset_id":    grant.AssetID,
+			"provider_id": grant.ProviderID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("AssetUpload: finalize: %w", err)
+		}
+		var meta AssetMeta
+		if err := readJSON(finResp, &meta); err != nil {
+			return nil, fmt.Errorf("AssetUpload: finalize: %w", err)
+		}
+		return &meta, nil
+	}
+
+	// Content already present (or provider off): return current metadata.
+	getResp, err := c.Do(http.MethodGet, "/internal/v1/assets/"+strconv.FormatInt(grant.AssetID, 10)+"?workspace_id="+url.QueryEscape(ws), nil)
+	if err != nil {
+		return nil, fmt.Errorf("AssetUpload: meta: %w", err)
+	}
+	var meta AssetMeta
+	if err := readJSON(getResp, &meta); err != nil {
+		return nil, fmt.Errorf("AssetUpload: meta: %w", err)
+	}
+	return &meta, nil
 }
 
-// ErrAssetUploadNotImplemented signals the deferred-impl state of
-// AssetUpload (v0.3.0). Callers should branch on this so they can
-// gracefully fall back / wait for v0.4.0 without crashing.
-var ErrAssetUploadNotImplemented = errors.New("sdk.AssetUpload: not implemented in v0.3.0; lands with the first SDK consumer (polar-video P11)")
+// ErrAssetUploadNotImplemented is retained for back-compat with callers
+// that branched on it during the stub era (v0.3.0–v0.5.x). AssetUpload
+// no longer returns it as of v0.6.0.
+//
+// Deprecated: AssetUpload is implemented; this is never returned.
+var ErrAssetUploadNotImplemented = errors.New("sdk.AssetUpload: implemented since v0.6.0")
