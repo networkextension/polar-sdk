@@ -92,6 +92,14 @@ type HeartbeatOpts struct {
 	// Callers pass runtime.GOOS / runtime.GOARCH.
 	OS   string `json:"os,omitempty"`
 	Arch string `json:"arch,omitempty"`
+
+	// PublicBaseURL is this plugin's externally reachable origin, e.g.
+	// "https://hosts.4950.store:2443". dock joins it with each UIRoute.Path
+	// to build absolute cross-subdomain links in the platform nav (GET
+	// /api/nav). A plugin that omits it is left out of the shared nav (it
+	// can still ship its own). Self-describing so 3rd-party modules on any
+	// domain need no central map.
+	PublicBaseURL string `json:"public_base_url,omitempty"`
 }
 
 // HeartbeatResult is dock's heartbeat response. Update is non-nil when dock
@@ -245,6 +253,9 @@ func (c *Client) HeartbeatV2(opts HeartbeatOpts) (*HeartbeatResult, error) {
 	}
 	if len(opts.UIRoutes) > 0 {
 		body["ui_routes"] = opts.UIRoutes
+	}
+	if opts.PublicBaseURL != "" {
+		body["public_base_url"] = opts.PublicBaseURL
 	}
 	resp, err := c.Do(http.MethodPost, "/internal/v1/plugin-registry/heartbeat", body)
 	if err != nil {
