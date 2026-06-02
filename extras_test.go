@@ -1,7 +1,11 @@
 package sdk
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -634,14 +638,21 @@ func TestAssetDelete_RejectsBadID(t *testing.T) {
 	}
 }
 
-func TestAssetDownload_StreamsBlob(t *testing.T) {
+// download-url 503 → AssetDownload falls back to the through-dock
+// /blob stream (provider mode off / older dock).
+func TestAssetDownload_FallsBackToBlob(t *testing.T) {
 	payload := []byte("the quick brown fox over the lazy dog")
 	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/internal/v1/assets/7/blob" {
+		switch r.URL.Path {
+		case "/internal/v1/assets/7/download-url":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"provider mode off"}`))
+		case "/internal/v1/assets/7/blob":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write(payload)
+		default:
 			t.Errorf("unexpected path: %q", r.URL.Path)
 		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(payload)
 	})
 	defer srv.Close()
 	c := newTestClient(srv.URL)
@@ -651,18 +662,138 @@ func TestAssetDownload_StreamsBlob(t *testing.T) {
 		t.Fatalf("AssetDownload: %v", err)
 	}
 	defer resp.Body.Close()
-	got := make([]byte, 1024)
-	n, _ := resp.Body.Read(got)
-	if string(got[:n]) != string(payload) {
-		t.Fatalf("body mismatch: got %q want %q", got[:n], payload)
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != string(payload) {
+		t.Fatalf("body mismatch: got %q want %q", got, payload)
 	}
 }
 
-func TestAssetUpload_StillStub(t *testing.T) {
+// download-url returns a signed provider URL → AssetDownload streams
+// straight from there, bypassing dock's /blob path entirely.
+func TestAssetDownload_DirectSignedURL(t *testing.T) {
+	payload := []byte("direct-from-provider-bytes")
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/internal/v1/assets/9/download-url":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"url": "http://" + r.Host + "/prov/v1/blob/deadbeef?token=1:2",
+			})
+		case "/prov/v1/blob/deadbeef":
+			w.Write(payload)
+		case "/internal/v1/assets/9/blob":
+			t.Errorf("should not hit through-dock blob when direct URL works")
+		default:
+			t.Errorf("unexpected path: %q", r.URL.Path)
+		}
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	resp, err := c.AssetDownload(&AssetMeta{ID: 9})
+	if err != nil {
+		t.Fatalf("AssetDownload: %v", err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != string(payload) {
+		t.Fatalf("direct body mismatch: got %q want %q", got, payload)
+	}
+}
+
+// Full signed-PUT round-trip: grant → PUT bytes direct to provider →
+// finalize. Asserts the sha the SDK computes is the content key, and
+// the bytes that land at the provider match the body.
+func TestAssetUpload_SignedPutRoundtrip(t *testing.T) {
+	body := []byte("module-binary-bytes-v0.0.3")
+	wantSHA := sha256.Sum256(body)
+	wantSHAHex := hex.EncodeToString(wantSHA[:])
+
+	var grantSHA, putPath string
+	var putBytes []byte
+	var finalized bool
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/internal/v1/assets/upload-grant":
+			var in map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			grantSHA, _ = in["sha256"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"asset_id":    int64(5),
+				"sha256":      grantSHA,
+				"exists":      false,
+				"put_url":     "http://" + r.Host + "/prov/v1/blob/" + grantSHA + "?exp=1&max=99&ct=x&sig=y",
+				"provider_id": int64(1),
+			})
+		case strings.HasPrefix(r.URL.Path, "/prov/v1/blob/"):
+			putPath = r.URL.Path
+			putBytes, _ = io.ReadAll(r.Body)
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha256": grantSHA, "size_bytes": len(putBytes)})
+		case r.URL.Path == "/internal/v1/assets/finalize":
+			finalized = true
+			_ = json.NewEncoder(w).Encode(AssetMeta{ID: 5, Kind: "module", Name: "buildings/darwin-arm64", SHA256: grantSHA, SizeBytes: int64(len(body))})
+		default:
+			t.Errorf("unexpected path: %q", r.URL.Path)
+		}
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	meta, err := c.AssetUpload(AssetUploadInput{Kind: "module", Name: "buildings/darwin-arm64"}, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("AssetUpload: %v", err)
+	}
+	if grantSHA != wantSHAHex {
+		t.Errorf("grant sha: got %q want %q", grantSHA, wantSHAHex)
+	}
+	if putPath != "/prov/v1/blob/"+wantSHAHex {
+		t.Errorf("put path: got %q", putPath)
+	}
+	if string(putBytes) != string(body) {
+		t.Errorf("provider bytes mismatch: got %q", putBytes)
+	}
+	if !finalized {
+		t.Error("finalize was not called")
+	}
+	if meta == nil || meta.ID != 5 || meta.SHA256 != wantSHAHex {
+		t.Errorf("returned meta: %+v", meta)
+	}
+}
+
+// exists=true (content dedup) → no PUT, no finalize; AssetUpload returns
+// the existing metadata.
+func TestAssetUpload_DedupSkipsPut(t *testing.T) {
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/internal/v1/assets/upload-grant":
+			_ = json.NewEncoder(w).Encode(map[string]any{"asset_id": int64(8), "exists": true})
+		case "/internal/v1/assets/8":
+			_ = json.NewEncoder(w).Encode(AssetMeta{ID: 8, Kind: "module", Name: "x"})
+		default:
+			t.Errorf("unexpected path (PUT/finalize should be skipped): %q", r.URL.Path)
+		}
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	meta, err := c.AssetUpload(AssetUploadInput{Kind: "module", Name: "x"}, strings.NewReader("dup"))
+	if err != nil {
+		t.Fatalf("AssetUpload: %v", err)
+	}
+	if meta == nil || meta.ID != 8 {
+		t.Errorf("expected existing meta id=8, got %+v", meta)
+	}
+}
+
+func TestAssetUpload_RejectsBadInput(t *testing.T) {
 	c := newTestClient("http://unused.invalid")
-	_, err := c.AssetUpload(AssetUploadInput{Kind: "model", Name: "x"}, strings.NewReader("body"))
-	if err != ErrAssetUploadNotImplemented {
-		t.Fatalf("expected ErrAssetUploadNotImplemented, got: %v", err)
+	if _, err := c.AssetUpload(AssetUploadInput{Name: "x"}, strings.NewReader("b")); err == nil {
+		t.Error("expected error for missing kind")
+	}
+	if _, err := c.AssetUpload(AssetUploadInput{Kind: "k", Name: "n"}, nil); err == nil {
+		t.Error("expected error for nil body")
+	}
+	if _, err := c.AssetUpload(AssetUploadInput{Kind: "k", Name: "n"}, strings.NewReader("")); err == nil {
+		t.Error("expected error for empty body")
 	}
 }
 
