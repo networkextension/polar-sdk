@@ -937,6 +937,35 @@ func (c *Client) AssetDownload(ref *AssetMeta) (*http.Response, error) {
 	return c.Do(http.MethodGet, "/internal/v1/assets/"+idStr+"/blob", nil)
 }
 
+// AssetDownloadURL returns a signed, time-limited, publicly-fetchable
+// HTTPS URL for the asset's bytes — the provider's signed GET URL. Use
+// this where a device or browser fetches the blob directly with no Polar
+// session: the iOS OTA install .plist (<url> → .ipa for itms-services /
+// QR install) and <img>/<video> src. The URL is short-lived, so mint a
+// fresh one per request rather than caching it.
+//
+// Errors if the dock has providers disabled (no signed URL to hand out) —
+// in that deployment the caller must proxy bytes itself via AssetDownload.
+func (c *Client) AssetDownloadURL(assetID int64) (string, error) {
+	if assetID <= 0 {
+		return "", errInvalid("AssetDownloadURL: assetID required")
+	}
+	resp, err := c.Do(http.MethodGet, "/internal/v1/assets/"+strconv.FormatInt(assetID, 10)+"/download-url", nil)
+	if err != nil {
+		return "", err
+	}
+	var grant struct {
+		URL string `json:"url"`
+	}
+	if err := readJSON(resp, &grant); err != nil {
+		return "", err
+	}
+	if grant.URL == "" {
+		return "", errInvalid("AssetDownloadURL: empty url (dock provider mode off)")
+	}
+	return grant.URL, nil
+}
+
 // assetUploadGrantResp mirrors POST /internal/v1/assets/upload-grant.
 type assetUploadGrantResp struct {
 	AssetID    int64  `json:"asset_id"`
