@@ -700,6 +700,37 @@ func TestAssetDownload_DirectSignedURL(t *testing.T) {
 	}
 }
 
+// AssetDownloadURLWS must forward the caller's workspace_id as a query
+// param so dock can authorize a workspace-private asset. The plain
+// AssetDownloadURL (ws="") must send no workspace_id.
+func TestAssetDownloadURL_WorkspaceParam(t *testing.T) {
+	var gotQuery string
+	srv := newSignedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/assets/9/download-url" {
+			t.Errorf("unexpected path: %q", r.URL.Path)
+		}
+		gotQuery = r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(map[string]any{"url": "http://x/prov/blob?token=1:2"})
+	})
+	defer srv.Close()
+	c := newTestClient(srv.URL)
+
+	if _, err := c.AssetDownloadURLWS(9, "ws_abc"); err != nil {
+		t.Fatalf("AssetDownloadURLWS: %v", err)
+	}
+	if gotQuery != "workspace_id=ws_abc" {
+		t.Fatalf("ws query = %q, want workspace_id=ws_abc", gotQuery)
+	}
+
+	gotQuery = "sentinel"
+	if _, err := c.AssetDownloadURL(9); err != nil {
+		t.Fatalf("AssetDownloadURL: %v", err)
+	}
+	if gotQuery != "" {
+		t.Fatalf("plain download-url should send no query, got %q", gotQuery)
+	}
+}
+
 // Full signed-PUT round-trip: grant → PUT bytes direct to provider →
 // finalize. Asserts the sha the SDK computes is the content key, and
 // the bytes that land at the provider match the body.

@@ -915,8 +915,14 @@ func (c *Client) AssetDownload(ref *AssetMeta) (*http.Response, error) {
 	}
 	idStr := strconv.FormatInt(ref.ID, 10)
 
-	// Try the direct (dock-bypassing) path first.
-	resp, err := c.Do(http.MethodGet, "/internal/v1/assets/"+idStr+"/download-url", nil)
+	// Try the direct (dock-bypassing) path first. Carry the asset's own
+	// workspace_id so dock authorizes a workspace-private blob (without it
+	// dock 404s tenant-scoped assets, falling back to the through-dock path).
+	dlPath := "/internal/v1/assets/" + idStr + "/download-url"
+	if ref.WorkspaceID != nil && *ref.WorkspaceID != "" {
+		dlPath += "?workspace_id=" + url.QueryEscape(*ref.WorkspaceID)
+	}
+	resp, err := c.Do(http.MethodGet, dlPath, nil)
 	if err == nil && resp.StatusCode/100 == 2 {
 		var grant struct {
 			URL string `json:"url"`
@@ -947,10 +953,23 @@ func (c *Client) AssetDownload(ref *AssetMeta) (*http.Response, error) {
 // Errors if the dock has providers disabled (no signed URL to hand out) —
 // in that deployment the caller must proxy bytes itself via AssetDownload.
 func (c *Client) AssetDownloadURL(assetID int64) (string, error) {
+	return c.AssetDownloadURLWS(assetID, "")
+}
+
+// AssetDownloadURLWS is AssetDownloadURL scoped to a workspace. Pass the
+// caller's workspace_id so dock can authorize a workspace-private asset;
+// without it dock only hands out URLs for public assets and returns 404
+// for tenant-scoped blobs (e.g. a plugin's per-workspace screenshots).
+// Use AssetDownloadURL (ws="") only for genuinely public assets.
+func (c *Client) AssetDownloadURLWS(assetID int64, workspaceID string) (string, error) {
 	if assetID <= 0 {
 		return "", errInvalid("AssetDownloadURL: assetID required")
 	}
-	resp, err := c.Do(http.MethodGet, "/internal/v1/assets/"+strconv.FormatInt(assetID, 10)+"/download-url", nil)
+	path := "/internal/v1/assets/" + strconv.FormatInt(assetID, 10) + "/download-url"
+	if workspaceID != "" {
+		path += "?workspace_id=" + url.QueryEscape(workspaceID)
+	}
+	resp, err := c.Do(http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
 	}
