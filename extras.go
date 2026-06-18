@@ -985,8 +985,11 @@ func (c *Client) AssetDownloadURLWS(assetID int64, workspaceID string) (string, 
 	return grant.URL, nil
 }
 
-// assetUploadGrantResp mirrors POST /internal/v1/assets/upload-grant.
-type assetUploadGrantResp struct {
+// AssetGrant is the response of POST /internal/v1/assets/upload-grant: the
+// catalog asset id for a (kind,name,version,sha256), whether the content
+// already exists (dedup), the provider PUT URL to upload the bytes to (empty
+// when Exists), and the provider id to pass back to AssetFinalize.
+type AssetGrant struct {
 	AssetID    int64  `json:"asset_id"`
 	SHA256     string `json:"sha256"`
 	Exists     bool   `json:"exists"`
@@ -1040,30 +1043,9 @@ func (c *Client) AssetUpload(input AssetUploadInput, body io.Reader) (*AssetMeta
 	sha := hex.EncodeToString(h.Sum(nil))
 
 	// 2. Ask dock for a grant.
-	ws := ""
-	if input.WorkspaceID != nil {
-		ws = *input.WorkspaceID
-	}
-	grantBody := map[string]any{
-		"workspace_id": ws,
-		"kind":         input.Kind,
-		"name":         input.Name,
-		"version":      input.Version,
-		"sha256":       sha,
-		"size_bytes":   size,
-		"mime":         mime,
-		"visibility":   input.Visibility,
-		"pinned":       input.Pinned,
-		"source_url":   input.SourceURL,
-		"metadata":     input.Metadata,
-	}
-	resp, err := c.Do(http.MethodPost, "/internal/v1/assets/upload-grant", grantBody)
+	grant, err := c.AssetUploadGrant(input, sha, size)
 	if err != nil {
-		return nil, fmt.Errorf("AssetUpload: grant: %w", err)
-	}
-	var grant assetUploadGrantResp
-	if err := readJSON(resp, &grant); err != nil {
-		return nil, fmt.Errorf("AssetUpload: grant: %w", err)
+		return nil, fmt.Errorf("AssetUpload: %w", err)
 	}
 
 	// 3. PUT bytes direct to the provider — unless the content already
@@ -1087,21 +1069,18 @@ func (c *Client) AssetUpload(input AssetUploadInput, body io.Reader) (*AssetMeta
 		}
 
 		// 4. Finalize: mark ready + bump usage.
-		finResp, err := c.Do(http.MethodPost, "/internal/v1/assets/finalize", map[string]any{
-			"asset_id":    grant.AssetID,
-			"provider_id": grant.ProviderID,
-		})
+		meta, err := c.AssetFinalize(grant.AssetID, grant.ProviderID)
 		if err != nil {
-			return nil, fmt.Errorf("AssetUpload: finalize: %w", err)
+			return nil, fmt.Errorf("AssetUpload: %w", err)
 		}
-		var meta AssetMeta
-		if err := readJSON(finResp, &meta); err != nil {
-			return nil, fmt.Errorf("AssetUpload: finalize: %w", err)
-		}
-		return &meta, nil
+		return meta, nil
 	}
 
 	// Content already present (or provider off): return current metadata.
+	ws := ""
+	if input.WorkspaceID != nil {
+		ws = *input.WorkspaceID
+	}
 	getResp, err := c.Do(http.MethodGet, "/internal/v1/assets/"+strconv.FormatInt(grant.AssetID, 10)+"?workspace_id="+url.QueryEscape(ws), nil)
 	if err != nil {
 		return nil, fmt.Errorf("AssetUpload: meta: %w", err)
@@ -1109,6 +1088,75 @@ func (c *Client) AssetUpload(input AssetUploadInput, body io.Reader) (*AssetMeta
 	var meta AssetMeta
 	if err := readJSON(getResp, &meta); err != nil {
 		return nil, fmt.Errorf("AssetUpload: meta: %w", err)
+	}
+	return &meta, nil
+}
+
+// AssetUploadGrant requests a content-addressed upload grant for a blob whose
+// sha256 + size are already known, without streaming any bytes. It is the
+// first step of the direct, dock-bypassing signed-PUT path — the caller (or a
+// remote client it hands the grant to) then PUTs the bytes to grant.PutURL and
+// calls AssetFinalize. When the content already exists, grant.Exists is true
+// and grant.PutURL is empty (dedup; skip the PUT, just finalize/record).
+//
+// This is what AssetUpload uses internally; it's exported so a module can mint
+// a grant for an external uploader (e.g. filmscan PUTs keyframes straight to
+// the provider) instead of funnelling the bytes through the module process.
+func (c *Client) AssetUploadGrant(input AssetUploadInput, sha256 string, size int64) (*AssetGrant, error) {
+	if strings.TrimSpace(input.Kind) == "" || strings.TrimSpace(input.Name) == "" {
+		return nil, errInvalid("AssetUploadGrant: kind + name required")
+	}
+	if strings.TrimSpace(sha256) == "" || size <= 0 {
+		return nil, errInvalid("AssetUploadGrant: sha256 + positive size required")
+	}
+	if input.Version == "" {
+		input.Version = "v1"
+	}
+	mime := input.Mime
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	ws := ""
+	if input.WorkspaceID != nil {
+		ws = *input.WorkspaceID
+	}
+	resp, err := c.Do(http.MethodPost, "/internal/v1/assets/upload-grant", map[string]any{
+		"workspace_id": ws,
+		"kind":         input.Kind,
+		"name":         input.Name,
+		"version":      input.Version,
+		"sha256":       sha256,
+		"size_bytes":   size,
+		"mime":         mime,
+		"visibility":   input.Visibility,
+		"pinned":       input.Pinned,
+		"source_url":   input.SourceURL,
+		"metadata":     input.Metadata,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("AssetUploadGrant: %w", err)
+	}
+	var grant AssetGrant
+	if err := readJSON(resp, &grant); err != nil {
+		return nil, fmt.Errorf("AssetUploadGrant: %w", err)
+	}
+	return &grant, nil
+}
+
+// AssetFinalize marks a previously-granted blob ready (after its bytes have
+// been PUT to the provider) and bumps the workspace usage. Returns the catalog
+// AssetMeta. Pair it with AssetUploadGrant for the externally-uploaded path.
+func (c *Client) AssetFinalize(assetID, providerID int64) (*AssetMeta, error) {
+	resp, err := c.Do(http.MethodPost, "/internal/v1/assets/finalize", map[string]any{
+		"asset_id":    assetID,
+		"provider_id": providerID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("AssetFinalize: %w", err)
+	}
+	var meta AssetMeta
+	if err := readJSON(resp, &meta); err != nil {
+		return nil, fmt.Errorf("AssetFinalize: %w", err)
 	}
 	return &meta, nil
 }
