@@ -37,7 +37,7 @@ func TestSelfApply_ArchiveNeedsDestRoot(t *testing.T) {
 // tar.gz test fixtures from selfinstall_test.go.
 func TestSelfApply_ArchiveDispatches(t *testing.T) {
 	archive := buildTarGz(t, []tarEntry{
-		{"install.sh", "#!/bin/sh\ntouch \"$POLAR_NEW_DIR/applied.marker\"\n", 0o755},
+		{name: "install.sh", body: "#!/bin/sh\ntouch \"$POLAR_NEW_DIR/applied.marker\"\n", mode: 0o755},
 	})
 	d := serveArchive(t, archive, "install.sh")
 	root := t.TempDir()

@@ -198,6 +198,8 @@ func repointSymlink(linkPath, target string) error {
 
 // safeJoin joins dir + a (possibly hostile) archive entry name, rejecting any
 // path that would escape dir (absolute paths, "..", symlinked parents).
+// It returns ("", nil) for the archive root entry ("." / "./", as produced by
+// `tar -C dir .`), which the caller skips — that's a benign no-op, not an error.
 func safeJoin(dir, name string) (string, error) {
 	if name == "" {
 		return "", errors.New("empty entry name")
@@ -215,7 +217,7 @@ func safeJoin(dir, name string) (string, error) {
 	}
 	clean := filepath.Clean(norm)
 	if clean == "" || clean == "." {
-		return "", fmt.Errorf("empty entry path: %q", name)
+		return "", nil // archive root entry → caller skips
 	}
 	out := filepath.Join(dir, clean)
 	if out != dir && !strings.HasPrefix(out, dir+string(os.PathSeparator)) {
@@ -247,6 +249,9 @@ func unpackTarGz(archivePath, destDir string) error {
 		target, err := safeJoin(destDir, hdr.Name)
 		if err != nil {
 			return err
+		}
+		if target == "" {
+			continue // archive root entry
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -289,6 +294,9 @@ func unpackZip(archivePath, destDir string) error {
 		target, err := safeJoin(destDir, zf.Name)
 		if err != nil {
 			return err
+		}
+		if target == "" {
+			continue // archive root entry
 		}
 		if zf.FileInfo().IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
