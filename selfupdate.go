@@ -158,20 +158,33 @@ type ReleaseManifest struct {
 	Size     int64  `json:"size"`
 	MinHost  string `json:"min_host,omitempty"`
 	Notes    string `json:"notes,omitempty"`
+	// Format/Entrypoint describe a non-binary artifact (an archive + install
+	// script). Empty Format = a plain binary (SelfUpdate). See SelfInstall.
+	Format     string `json:"format,omitempty"`
+	Entrypoint string `json:"entrypoint,omitempty"`
 }
 
 // canonicalBytes reproduces polar-release's signing input EXACTLY. Any
 // drift here silently breaks verification, so keep it byte-for-byte in
-// lockstep with release's Manifest.canonicalBytes (notes are NOT signed).
+// lockstep with release's Manifest.canonicalBytes (notes are NOT signed;
+// format/entrypoint are appended ONLY when non-empty, so a legacy binary
+// manifest's bytes are unchanged from before those fields existed).
 func (m ReleaseManifest) canonicalBytes() []byte {
-	return []byte("polar-release/v1\n" +
+	s := "polar-release/v1\n" +
 		"module=" + m.Module + "\n" +
 		"version=" + m.Version + "\n" +
 		"channel=" + m.Channel + "\n" +
 		"platform=" + m.Platform + "\n" +
 		"sha256=" + m.SHA256 + "\n" +
 		"size=" + strconv.FormatInt(m.Size, 10) + "\n" +
-		"min_host=" + m.MinHost + "\n")
+		"min_host=" + m.MinHost + "\n"
+	if m.Format != "" {
+		s += "format=" + m.Format + "\n"
+	}
+	if m.Entrypoint != "" {
+		s += "entrypoint=" + m.Entrypoint + "\n"
+	}
+	return []byte(s)
 }
 
 // verifyReleaseSignature checks the directive's ed25519 signature over its
