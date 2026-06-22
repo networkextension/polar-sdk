@@ -974,13 +974,25 @@ func (c *Client) AssetDownloadURLWS(assetID int64, workspaceID string) (string, 
 		return "", err
 	}
 	var grant struct {
-		URL string `json:"url"`
+		URL  string `json:"url"`
+		Mime string `json:"mime"`
 	}
 	if err := readJSON(resp, &grant); err != nil {
 		return "", err
 	}
 	if grant.URL == "" {
 		return "", errInvalid("AssetDownloadURL: empty url (dock provider mode off)")
+	}
+	// Append the asset's real mime as ?ct= so the assets blob handler serves a
+	// proper Content-Type (the blob store is sha-keyed and has no mime of its
+	// own). Without this it falls back to application/octet-stream, which
+	// Safari's <audio>/<video> refuse to play (Chrome content-sniffs anyway).
+	if grant.Mime != "" {
+		sep := "&"
+		if !strings.Contains(grant.URL, "?") {
+			sep = "?"
+		}
+		return grant.URL + sep + "ct=" + url.QueryEscape(grant.Mime), nil
 	}
 	return grant.URL, nil
 }
