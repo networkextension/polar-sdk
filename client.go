@@ -13,8 +13,8 @@
 //   - DockBase           — e.g. "http://127.0.0.1:8080"
 //   - PluginName         — must match the plugin_modules.name row in dock
 //   - HMACKey ([]byte)   — the 64-byte hex string returned by
-//                          hex.EncodeToString(sha256.Sum256([]byte(plaintext)))
-//                          NOT the plaintext token dock printed once
+//     hex.EncodeToString(sha256.Sum256([]byte(plaintext)))
+//     NOT the plaintext token dock printed once
 //   - HTTP (optional)    — replace for tests / timeouts
 package sdk
 
@@ -44,8 +44,9 @@ type Client struct {
 	HMACKey []byte
 	HTTP    *http.Client
 
-	authMu    sync.Mutex
-	authCache map[string]authCacheEntry
+	authMu         sync.Mutex
+	authCache      map[string]authCacheEntry
+	agentAuthCache map[string]agentAuthCacheEntry
 }
 
 // AuthVerifyResult mirrors GET /internal/v1/auth/verify response body.
@@ -55,6 +56,18 @@ type AuthVerifyResult struct {
 	Role        string `json:"role"`
 	WorkspaceID string `json:"workspace_id"`
 	ExpiresAt   string `json:"expires_at"`
+}
+
+// AgentVerifyResult mirrors GET /internal/v1/auth/verify-agent response body.
+type AgentVerifyResult struct {
+	TokenID     string `json:"token_id"`
+	UserID      string `json:"user_id"`
+	WorkspaceID string `json:"workspace_id"`
+}
+
+type agentAuthCacheEntry struct {
+	res     AgentVerifyResult
+	storeAt time.Time
 }
 
 type authCacheEntry struct {
@@ -71,11 +84,11 @@ type authCacheEntry struct {
 // dock preserves the existing value when UIRoutes is nil/empty so
 // a heartbeat that doesn't carry routes never blanks the column.
 type UIRoute struct {
-	Path      string `json:"path"`                  // "/expense.html"
-	Label     string `json:"label"`                 // "家庭账本"
-	Icon      string `json:"icon,omitempty"`        // lucide icon name (optional)
-	AdminOnly bool   `json:"admin_only,omitempty"`  // UI hint: hide for non-admin role
-	Order     int    `json:"order,omitempty"`       // UI sort hint; ties broken by label
+	Path      string `json:"path"`                 // "/expense.html"
+	Label     string `json:"label"`                // "家庭账本"
+	Icon      string `json:"icon,omitempty"`       // lucide icon name (optional)
+	AdminOnly bool   `json:"admin_only,omitempty"` // UI hint: hide for non-admin role
+	Order     int    `json:"order,omitempty"`      // UI sort hint; ties broken by label
 }
 
 // HeartbeatOpts is the POST /internal/v1/plugin-registry/heartbeat body.
@@ -131,11 +144,12 @@ type UpdateDirective struct {
 // Override .HTTP afterwards if you need a different policy.
 func NewClient(dockBase, pluginName string, hmacKey []byte) *Client {
 	return &Client{
-		DockBase:   strings.TrimRight(dockBase, "/"),
-		PluginName: pluginName,
-		HMACKey:    hmacKey,
-		HTTP:       &http.Client{Timeout: 15 * time.Second},
-		authCache:  make(map[string]authCacheEntry),
+		DockBase:       strings.TrimRight(dockBase, "/"),
+		PluginName:     pluginName,
+		HMACKey:        hmacKey,
+		HTTP:           &http.Client{Timeout: 15 * time.Second},
+		authCache:      make(map[string]authCacheEntry),
+		agentAuthCache: make(map[string]agentAuthCacheEntry),
 	}
 }
 
@@ -237,6 +251,51 @@ func (c *Client) AuthVerifyWS(token, workspaceID string) (*AuthVerifyResult, err
 		for k, e := range c.authCache {
 			if e.storeAt.Before(cutoff) {
 				delete(c.authCache, k)
+			}
+		}
+	}
+	c.authMu.Unlock()
+	return &out, nil
+}
+
+// AuthVerifyAgent resolves an AGENT bearer token (polar_agent_…) via dock's
+// /internal/v1/auth/verify-agent. This is what lets a plugin authenticate an
+// agent: agent tokens are neither sessions nor polar_ keys, so until this
+// endpoint existed only dock could verify them — trapping agent-authenticated
+// surfaces (e.g. the compute-task claim API) inside dock. Cached 30s per token,
+// mirroring AuthVerify. Returns the token's owner + the owner's personal
+// workspace. An invalid/revoked token returns an error (dock answers 401).
+func (c *Client) AuthVerifyAgent(token string) (*AgentVerifyResult, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, errors.New("AuthVerifyAgent: empty token")
+	}
+	c.authMu.Lock()
+	if entry, ok := c.agentAuthCache[token]; ok && time.Since(entry.storeAt) < 30*time.Second {
+		c.authMu.Unlock()
+		res := entry.res
+		return &res, nil
+	}
+	c.authMu.Unlock()
+
+	resp, err := c.Do(http.MethodGet, "/internal/v1/auth/verify-agent?token="+url.QueryEscape(token), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out AgentVerifyResult
+	if err := readJSON(resp, &out); err != nil {
+		return nil, err // non-2xx (invalid/revoked) propagates; nothing cached
+	}
+	c.authMu.Lock()
+	if c.agentAuthCache == nil {
+		c.agentAuthCache = make(map[string]agentAuthCacheEntry)
+	}
+	c.agentAuthCache[token] = agentAuthCacheEntry{res: out, storeAt: time.Now()}
+	if len(c.agentAuthCache) > 1000 {
+		cutoff := time.Now().Add(-30 * time.Second)
+		for k, e := range c.agentAuthCache {
+			if e.storeAt.Before(cutoff) {
+				delete(c.agentAuthCache, k)
 			}
 		}
 	}
