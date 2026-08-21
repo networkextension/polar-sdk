@@ -108,6 +108,25 @@ type AgentPresence struct {
 	LastSeenAt string `json:"last_seen_at,omitempty"`
 }
 
+// AgentInfo is the shape returned by GET /internal/v1/agents/:id — one
+// agents-v4 row joined with its host (machine facts). Online is dock's
+// composite liveness: 60s freshness on hosts.last_seen_at /
+// agents.last_hello_at, with a live hub-attach fallback.
+type AgentInfo struct {
+	ID             string `json:"id"`
+	WorkspaceID    string `json:"workspace_id"`
+	Name           string `json:"name"`
+	OS             string `json:"os,omitempty"`
+	Arch           string `json:"arch,omitempty"`
+	HostID         string `json:"host_id,omitempty"`
+	HostName       string `json:"host_name,omitempty"`
+	HostOS         string `json:"host_os,omitempty"`
+	HostArch       string `json:"host_arch,omitempty"`
+	Online         bool   `json:"online"`
+	LastHelloAt    string `json:"last_hello_at,omitempty"`
+	HostLastSeenAt string `json:"host_last_seen_at,omitempty"`
+}
+
 // AgentDispatchRequest mirrors POST /internal/v1/agent/dispatch. Fields
 // are a strict subset of dock's aiAgentTask — plugin tasks don't get to
 // pin per-task workdir or git-remote overrides (those are project-level
@@ -130,17 +149,17 @@ type AgentDispatchResponse struct {
 // go through AgentDispatch) call this to keep the cost ledger
 // consistent — same shape as dock's internal recordAgentLLMCall helper.
 type AgentLLMCallRecord struct {
-	WorkspaceID      string  `json:"workspace_id"`
-	LLMConfigID      int64   `json:"llm_config_id"`
-	ModelRequested   string  `json:"model_requested"`
-	ModelResolved    string  `json:"model_resolved"`
-	PromptTokens     int     `json:"prompt_tokens"`
-	CompletionTokens int     `json:"completion_tokens"`
-	TotalTokens      int     `json:"total_tokens"`
-	LatencyMS        int     `json:"latency_ms"`
-	StatusCode       int     `json:"status_code"`
-	ErrorText        string  `json:"error_text,omitempty"`
-	CostOverrideUSD *float64 `json:"cost_override_usd,omitempty"`
+	WorkspaceID      string   `json:"workspace_id"`
+	LLMConfigID      int64    `json:"llm_config_id"`
+	ModelRequested   string   `json:"model_requested"`
+	ModelResolved    string   `json:"model_resolved"`
+	PromptTokens     int      `json:"prompt_tokens"`
+	CompletionTokens int      `json:"completion_tokens"`
+	TotalTokens      int      `json:"total_tokens"`
+	LatencyMS        int      `json:"latency_ms"`
+	StatusCode       int      `json:"status_code"`
+	ErrorText        string   `json:"error_text,omitempty"`
+	CostOverrideUSD  *float64 `json:"cost_override_usd,omitempty"`
 }
 
 // AgentTokenIssueRequest mirrors POST /internal/v1/agent-tokens/issue.
@@ -219,22 +238,22 @@ type HostIssueResponse struct {
 //
 // Field contract:
 //   - EnrollToken       — already consumed by the calling plugin; dock
-//                         uses it only for audit ("who issued this agent_id").
+//     uses it only for audit ("who issued this agent_id").
 //   - Name              — operator-chosen label; UNIQUE per workspace at
-//                         the agents table level (server returns 409 on dup).
+//     the agents table level (server returns 409 on dup).
 //   - MachineUUIDRaw    — raw IOPlatformUUID / machine-id / smbios UUID.
-//                         Hashed via sha256(salt + raw) to derive host_id;
-//                         the raw value is dropped immediately and NEVER
-//                         persisted. Required for v4 (legacy "" path is
-//                         gone).
+//     Hashed via sha256(salt + raw) to derive host_id;
+//     the raw value is dropped immediately and NEVER
+//     persisted. Required for v4 (legacy "" path is
+//     gone).
 //   - HostInfo          — hw_model / cpu_brand / cpu_cores / mem_total_bytes
-//                         / os_name / os_version / etc. UPSERT'd into the
-//                         hosts row keyed on the derived host_id.
+//     / os_name / os_version / etc. UPSERT'd into the
+//     hosts row keyed on the derived host_id.
 //   - BotUserID         — optional. When non-empty dock skips bot
-//                         auto-create and binds the agent to this
-//                         existing bot. Empty → dock auto-creates a bot
-//                         named "bot-<agent_name>-<short_id>" bound to
-//                         the workspace's agent-pool llm_proxy_token.
+//     auto-create and binds the agent to this
+//     existing bot. Empty → dock auto-creates a bot
+//     named "bot-<agent_name>-<short_id>" bound to
+//     the workspace's agent-pool llm_proxy_token.
 type AgentRegisterRequest struct {
 	EnrollToken    string         `json:"enroll_token"`
 	WorkspaceID    string         `json:"workspace_id"`
@@ -249,30 +268,30 @@ type AgentRegisterRequest struct {
 // AgentRegisterResponse is what /internal/v1/agents/register returns.
 //
 //   - AgentID    — server-minted "ag_<random32hex>". Persisted in
-//                  agent.toml on the polar-agent box.
+//     agent.toml on the polar-agent box.
 //   - HostID     — sha256(salt + raw)[:32] hex. Stable across re-installs
-//                  on the same hardware (operator backs up agent.toml,
-//                  reinstalls OS, same host_id resolves).
+//     on the same hardware (operator backs up agent.toml,
+//     reinstalls OS, same host_id resolves).
 //   - BotUserID  — bot the agent should attach as. Either the existing
-//                  bot the caller passed in via BotUserID, or the
-//                  freshly-auto-created one.
+//     bot the caller passed in via BotUserID, or the
+//     freshly-auto-created one.
 //   - AgentTokenRaw — raw "polar_agent_<...>" auth credential. Plaintext;
-//                  shown once, agent persists it in agent.toml. Server
-//                  only retains the sha256 hash via agent_tokens. JSON
-//                  wire tag is "agent_token_raw" to match the public
-//                  polar-hosts /api/hosts/register response shape — that
-//                  endpoint is what polar-agent CLI parses, so the SDK
-//                  uses the same name (rather than the older "token"
-//                  which left two field names for one value).
+//     shown once, agent persists it in agent.toml. Server
+//     only retains the sha256 hash via agent_tokens. JSON
+//     wire tag is "agent_token_raw" to match the public
+//     polar-hosts /api/hosts/register response shape — that
+//     endpoint is what polar-agent CLI parses, so the SDK
+//     uses the same name (rather than the older "token"
+//     which left two field names for one value).
 //   - Server     — canonical control-plane URL the agent should use for
-//                  /ws/agent (defaultServer echoed back; lets the CLI
-//                  fall back to a sane value when --server wasn't passed).
+//     /ws/agent (defaultServer echoed back; lets the CLI
+//     fall back to a sane value when --server wasn't passed).
 //   - ProxyToken / ProxyBaseURL / DefaultModel — the agent's per-agent
-//                  LLM proxy credential (named agent:<id>) + the dock
-//                  proxy origin (…/api/proxy/v1) + the workspace default
-//                  model. Lets the agent call dock's billed/audited LLM
-//                  proxy directly for its own (non-dispatched) calls.
-//                  Plaintext shown once; persist alongside AgentTokenRaw.
+//     LLM proxy credential (named agent:<id>) + the dock
+//     proxy origin (…/api/proxy/v1) + the workspace default
+//     model. Lets the agent call dock's billed/audited LLM
+//     proxy directly for its own (non-dispatched) calls.
+//     Plaintext shown once; persist alongside AgentTokenRaw.
 type AgentRegisterResponse struct {
 	AgentID       string `json:"agent_id"`
 	HostID        string `json:"host_id"`
@@ -543,6 +562,31 @@ func (c *Client) AgentPresenceGet(botUserID string) (*AgentPresence, error) {
 		return nil, err
 	}
 	return &p, nil
+}
+
+// AgentGet wraps GET /internal/v1/agents/:id (id = "ag_…"). Resolves an
+// agent to its machine facts (os/arch/hostname/online). First consumer:
+// polar-firewall's fw-svc — pf compilation variants (macOS keeps the
+// com.apple anchor scaffolding) and machines-overlay enrichment.
+// workspaceID is optional; non-empty and mismatched → 404 (error).
+func (c *Client) AgentGet(agentID, workspaceID string) (*AgentInfo, error) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return nil, errInvalid("AgentGet: empty agent_id")
+	}
+	path := "/internal/v1/agents/" + url.PathEscape(agentID)
+	if ws := strings.TrimSpace(workspaceID); ws != "" {
+		path += "?workspace_id=" + url.QueryEscape(ws)
+	}
+	resp, err := c.Do(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var a AgentInfo
+	if err := readJSON(resp, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
 }
 
 // AgentDispatch wraps POST /internal/v1/agent/dispatch. Server returns
