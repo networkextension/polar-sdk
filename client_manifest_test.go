@@ -18,11 +18,11 @@ import (
 func TestAuthVerify_DecodesKindTokenIDScopes(t *testing.T) {
 	bodies := map[string]string{
 		// session: scopes null, token_id null
-		"sess": `{"user_id":"u1","username":"a","role":"admin","platform_role":"admin","module":"opera","module_role":"creator","workspace_id":"w1","expires_at":"2026-10-22T00:00:00Z","kind":"session","token_id":null,"scopes":null}`,
+		"sess": `{"user_id":"u1","username":"a","role":"admin","platform_role":"admin","module":"opera","module_role":"creator","workspace_id":"w1","expires_at":"2026-10-22T00:00:00Z","kind":"session","token_id":null,"scopes":null,"token_expires_at":null}`,
 		// api token, scoped but nothing for this module: scopes []
-		"empty": `{"user_id":"u1","username":"a","role":"member","workspace_id":"w1","expires_at":"","kind":"api_token","token_id":42,"scopes":[]}`,
+		"empty": `{"user_id":"u1","username":"a","role":"member","workspace_id":"w1","expires_at":"","kind":"api_token","token_id":42,"scopes":[],"token_expires_at":null}`,
 		// api token with module scopes
-		"scoped": `{"user_id":"u1","username":"a","role":"member","workspace_id":"w1","expires_at":"","kind":"api_token","token_id":7,"scopes":["opera:sessions:read","opera:devices:*"]}`,
+		"scoped": `{"user_id":"u1","username":"a","role":"member","workspace_id":"w1","expires_at":"","kind":"api_token","token_id":7,"scopes":["opera:sessions:read","opera:devices:*"],"token_expires_at":"2027-03-01T00:00:00Z"}`,
 		// older dock: none of the new fields
 		"old": `{"user_id":"u1","username":"a","role":"member","workspace_id":"w1","expires_at":""}`,
 	}
@@ -72,12 +72,18 @@ func TestAuthVerify_DecodesKindTokenIDScopes(t *testing.T) {
 	if !scoped.HasScope("opera:sessions:read") || !scoped.HasScope("opera:devices:read") || scoped.HasScope("opera:markers:write") {
 		t.Fatalf("scoped HasScope wrong: %+v", *scoped.Scopes)
 	}
+	if scoped.TokenExpiresAt == nil || *scoped.TokenExpiresAt != "2027-03-01T00:00:00Z" {
+		t.Fatalf("scoped token_expires_at: %v", scoped.TokenExpiresAt)
+	}
+	if empty.TokenExpiresAt != nil || sess.TokenExpiresAt != nil {
+		t.Fatalf("never-expiring / session token_expires_at must be nil: %v / %v", empty.TokenExpiresAt, sess.TokenExpiresAt)
+	}
 
 	old, err := c.AuthVerify("old")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if old.TokenKind() != "session" || old.TokenID != nil || old.Scopes != nil {
+	if old.TokenKind() != "session" || old.TokenID != nil || old.Scopes != nil || old.TokenExpiresAt != nil {
 		t.Fatalf("old dock defaults: %+v", old)
 	}
 }
@@ -90,7 +96,7 @@ func TestAuthVerify_CachedScopesPreserveNullVsEmptyAndDontAlias(t *testing.T) {
 			_, _ = io.WriteString(w, `{"user_id":"u","kind":"api_token","token_id":1,"scopes":null}`)
 			return
 		}
-		_, _ = io.WriteString(w, `{"user_id":"u","kind":"api_token","token_id":2,"scopes":[]}`)
+		_, _ = io.WriteString(w, `{"user_id":"u","kind":"api_token","token_id":2,"scopes":[],"token_expires_at":"2027-03-01T00:00:00Z"}`)
 	}))
 	defer srv.Close()
 	c := NewClient(srv.URL, "opera", DeriveHMACKey("x"))
@@ -104,9 +110,13 @@ func TestAuthVerify_CachedScopesPreserveNullVsEmptyAndDontAlias(t *testing.T) {
 		if err != nil || e.Scopes == nil || len(*e.Scopes) != 0 {
 			t.Fatalf("pass %d: [] scopes became %v (err %v)", i, e.Scopes, err)
 		}
+		if e.TokenExpiresAt == nil || *e.TokenExpiresAt != "2027-03-01T00:00:00Z" {
+			t.Fatalf("pass %d: token_expires_at became %v", i, e.TokenExpiresAt)
+		}
 		// Mutating the returned value must not poison the cache.
 		*e.Scopes = append(*e.Scopes, "*")
 		*e.TokenID = 99
+		*e.TokenExpiresAt = "poisoned"
 	}
 	if got := atomic.LoadInt32(&hits); got != 2 {
 		t.Fatalf("expected 2 upstream hits (second pass cached), got %d", got)
