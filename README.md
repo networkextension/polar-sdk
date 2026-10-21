@@ -13,6 +13,8 @@ Provides:
 - Token/host sync (v0.2.2): `IssueAgentToken`, `IssueHost` — plugins that mint agent tokens locally call these to dual-write into dock's canonical tables (fixes the polar-hosts split-brain)
 - Tenant access: `WorkspacePluginAccess(workspaceID, plugin)` — closed-by-default; root team always allowed
 - `Heartbeat` — plugin → dock liveness signal
+- `AuthVerify` result carries `Kind` (`session`/`api_token`), `TokenID`, and module-filtered `Scopes` (`nil` = unscoped, `[]` = scoped but nothing for this module); `HasScope(scope)` helper
+- `PutManifest(ctx, manifest)` — submit the module's roles/scopes/presets/routes manifest (`PUT /internal/v1/modules/{name}/manifest`)
 
 ## Install
 
