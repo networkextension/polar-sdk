@@ -60,7 +60,10 @@ type AuthVerifyResult struct {
 	Module       string `json:"module,omitempty"`
 	ModuleRole   string `json:"module_role,omitempty"`
 	WorkspaceID  string `json:"workspace_id"`
-	ExpiresAt    string `json:"expires_at"`
+	// ExpiresAt is how long this answer may be cached — for an api token
+	// min(now+30s, token expiry). It is NOT the token's lifetime; read
+	// TokenExpiresAt for that.
+	ExpiresAt string `json:"expires_at"`
 
 	// Kind is "session" for a browser session token or "api_token" for a
 	// long-lived polar_ API token. Older dock builds omit it; read it via
@@ -75,6 +78,10 @@ type AuthVerifyResult struct {
 	//   &[]{}      → the token is scoped, but has nothing for this module
 	// Keep the nil vs empty distinction — they mean opposite things.
 	Scopes *[]string `json:"scopes"`
+	// TokenExpiresAt is the api token's real expiry (RFC3339 UTC). nil →
+	// never expires, a session, or an older dock that does not send it
+	// (POLAROPERA-281).
+	TokenExpiresAt *string `json:"token_expires_at"`
 }
 
 // TokenKind returns Kind, defaulting to "session" when dock omitted it.
@@ -106,11 +113,16 @@ func (r *AuthVerifyResult) HasScope(scope string) bool {
 	return false
 }
 
-// clone returns a copy whose TokenID/Scopes don't alias the cached entry.
+// clone returns a copy whose TokenID/Scopes/TokenExpiresAt don't alias the
+// cached entry.
 func (r AuthVerifyResult) clone() AuthVerifyResult {
 	if r.TokenID != nil {
 		id := *r.TokenID
 		r.TokenID = &id
+	}
+	if r.TokenExpiresAt != nil {
+		exp := *r.TokenExpiresAt
+		r.TokenExpiresAt = &exp
 	}
 	if r.Scopes != nil {
 		sc := append([]string{}, (*r.Scopes)...)
