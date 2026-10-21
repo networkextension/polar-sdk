@@ -8,6 +8,7 @@
 //   - Client.Do(method, path, body) — signs + sends a request
 //   - Client.AuthVerify(token) — wraps GET /auth/verify with a 30s cache
 //   - Client.Heartbeat(opts) — wraps POST /plugin-registry/heartbeat
+//   - Client.PutManifest(ctx, m) — wraps PUT /modules/{name}/manifest
 //
 // What you bring:
 //   - DockBase           — e.g. "http://127.0.0.1:8080"
@@ -20,6 +21,7 @@ package sdk
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -51,11 +53,78 @@ type Client struct {
 
 // AuthVerifyResult mirrors GET /internal/v1/auth/verify response body.
 type AuthVerifyResult struct {
-	UserID      string `json:"user_id"`
-	Username    string `json:"username"`
-	Role        string `json:"role"`
-	WorkspaceID string `json:"workspace_id"`
-	ExpiresAt   string `json:"expires_at"`
+	UserID       string `json:"user_id"`
+	Username     string `json:"username"`
+	Role         string `json:"role"`
+	PlatformRole string `json:"platform_role,omitempty"`
+	Module       string `json:"module,omitempty"`
+	ModuleRole   string `json:"module_role,omitempty"`
+	WorkspaceID  string `json:"workspace_id"`
+	ExpiresAt    string `json:"expires_at"`
+
+	// Kind is "session" for a browser session token or "api_token" for a
+	// long-lived polar_ API token. Older dock builds omit it; read it via
+	// TokenKind() to get the "session" default.
+	Kind string `json:"kind,omitempty"`
+	// TokenID is the api token's id; nil for sessions.
+	TokenID *int64 `json:"token_id"`
+	// Scopes are the token's scopes filtered to the calling module
+	// ("<module>:…" entries plus "*" when present).
+	//   nil        → unscoped: a session, or an api token with no stored
+	//                scopes (dock treats that as full access)
+	//   &[]{}      → the token is scoped, but has nothing for this module
+	// Keep the nil vs empty distinction — they mean opposite things.
+	Scopes *[]string `json:"scopes"`
+}
+
+// TokenKind returns Kind, defaulting to "session" when dock omitted it.
+func (r *AuthVerifyResult) TokenKind() string {
+	if r == nil || r.Kind == "" {
+		return "session"
+	}
+	return r.Kind
+}
+
+// Unscoped reports whether the token carries no scope restriction
+// (Scopes == nil).
+func (r *AuthVerifyResult) Unscoped() bool { return r == nil || r.Scopes == nil }
+
+// HasScope reports whether the token grants scope. Unscoped tokens grant
+// everything; "*" and "<module>:*" wildcards are honoured.
+func (r *AuthVerifyResult) HasScope(scope string) bool {
+	if r == nil || r.Scopes == nil {
+		return true
+	}
+	for _, s := range *r.Scopes {
+		if s == scope || s == "*" {
+			return true
+		}
+		if strings.HasSuffix(s, ":*") && strings.HasPrefix(scope, strings.TrimSuffix(s, "*")) {
+			return true
+		}
+	}
+	return false
+}
+
+// clone returns a copy whose TokenID/Scopes don't alias the cached entry.
+func (r AuthVerifyResult) clone() AuthVerifyResult {
+	if r.TokenID != nil {
+		id := *r.TokenID
+		r.TokenID = &id
+	}
+	if r.Scopes != nil {
+		sc := append([]string{}, (*r.Scopes)...)
+		r.Scopes = &sc
+	}
+	return r
+}
+
+// ManifestAck mirrors the PUT /internal/v1/modules/{module}/manifest
+// response body.
+type ManifestAck struct {
+	Ack     bool   `json:"ack"`
+	Changed bool   `json:"changed"`
+	Version string `json:"version"`
 }
 
 // AgentVerifyResult mirrors GET /internal/v1/auth/verify-agent response body.
@@ -156,6 +225,11 @@ func NewClient(dockBase, pluginName string, hmacKey []byte) *Client {
 // Do signs + sends a request. body is JSON-marshalled if non-nil; pass
 // nil for GET / DELETE.
 func (c *Client) Do(method, path string, body any) (*http.Response, error) {
+	return c.DoContext(context.Background(), method, path, body)
+}
+
+// DoContext is Do with a request context.
+func (c *Client) DoContext(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	if c == nil {
 		return nil, errors.New("sdk.Client: nil receiver")
 	}
@@ -178,7 +252,7 @@ func (c *Client) Do(method, path string, body any) (*http.Response, error) {
 	mac.Write([]byte(canonical))
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	req, err := http.NewRequest(method, c.DockBase+path, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, method, c.DockBase+path, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +298,7 @@ func (c *Client) AuthVerifyWS(token, workspaceID string) (*AuthVerifyResult, err
 	c.authMu.Lock()
 	if entry, ok := c.authCache[key]; ok && time.Since(entry.storeAt) < 30*time.Second {
 		c.authMu.Unlock()
-		res := entry.res
+		res := entry.res.clone()
 		return &res, nil
 	}
 	c.authMu.Unlock()
@@ -242,7 +316,7 @@ func (c *Client) AuthVerifyWS(token, workspaceID string) (*AuthVerifyResult, err
 		return nil, err
 	}
 	c.authMu.Lock()
-	c.authCache[key] = authCacheEntry{res: out, storeAt: time.Now()}
+	c.authCache[key] = authCacheEntry{res: out.clone(), storeAt: time.Now()}
 	// Cheap GC: when the cache passes 1000 entries, drop anything
 	// older than the 30s window. Hot prod will see way fewer than
 	// that; this is just to keep a misbehaving caller from leaking.
@@ -356,6 +430,33 @@ func (c *Client) HeartbeatV2(opts HeartbeatOpts) (*HeartbeatResult, error) {
 		out.Update.URL = c.DockBase + out.Update.URL
 	}
 	return &out, nil
+}
+
+// PutManifest submits this module's permission manifest (roles, scopes,
+// presets, routes) to dock via a signed
+// PUT /internal/v1/modules/{PluginName}/manifest. dock rejects a module
+// other than the calling plugin (403) and invalid manifests (400, body
+// {"error": "..."}); both surface as an error. manifest is JSON-marshalled
+// as-is (a struct or map[string]any). Idempotent: resubmitting the same
+// manifest_version returns Changed == false. Call at startup, after the
+// first heartbeat.
+func (c *Client) PutManifest(ctx context.Context, manifest any) (ManifestAck, error) {
+	if c == nil {
+		return ManifestAck{}, errors.New("sdk.Client: nil receiver")
+	}
+	if manifest == nil {
+		return ManifestAck{}, errors.New("PutManifest: nil manifest")
+	}
+	path := "/internal/v1/modules/" + url.PathEscape(c.PluginName) + "/manifest"
+	resp, err := c.DoContext(ctx, http.MethodPut, path, manifest)
+	if err != nil {
+		return ManifestAck{}, err
+	}
+	var out ManifestAck
+	if err := readJSON(resp, &out); err != nil {
+		return ManifestAck{}, fmt.Errorf("PutManifest: %w", err)
+	}
+	return out, nil
 }
 
 // DeriveHMACKey turns the plaintext token dock printed at plugin
